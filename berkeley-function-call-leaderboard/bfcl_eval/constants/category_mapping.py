@@ -33,6 +33,13 @@ TEST_FILE_MAPPING = {
     "multi_turn_miss_param": f"{VERSION_PREFIX}_multi_turn_miss_param.json",
     "multi_turn_long_context": f"{VERSION_PREFIX}_multi_turn_long_context.json",
     # "multi_turn_composite": f"{VERSION_PREFIX}_multi_turn_composite.json",
+    
+    # Tool Scaling Datasets
+    "tool_scaling_5": f"{VERSION_PREFIX}_tool_scaling_5.json",
+    "tool_scaling_10": f"{VERSION_PREFIX}_tool_scaling_10.json",
+    "tool_scaling_20": f"{VERSION_PREFIX}_tool_scaling_20.json",
+    "tool_scaling_50": f"{VERSION_PREFIX}_tool_scaling_50.json",
+    "tool_scaling_128": f"{VERSION_PREFIX}_tool_scaling_128.json",
 }
 
 TEST_COLLECTION_MAPPING = {
@@ -124,6 +131,13 @@ TEST_COLLECTION_MAPPING = {
         "live_parallel_multiple",
         "live_irrelevance",
         "live_relevance",
+    ],
+    "tool_scaling": [
+        "tool_scaling_5",
+        "tool_scaling_10", 
+        "tool_scaling_20",
+        "tool_scaling_50",
+        "tool_scaling_128",
     ],
 }
 
