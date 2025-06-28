@@ -19,6 +19,7 @@ from bfcl_eval.eval_checker.multi_turn_eval.multi_turn_checker import (
     multi_turn_checker,
     multi_turn_irrelevance_checker,
 )
+from bfcl_eval.eval_checker.llm_judge.llm_judge_checker import llm_judge_checker
 from bfcl_eval.eval_checker.multi_turn_eval.multi_turn_utils import is_empty_execute_response
 from bfcl_eval.constants.model_config import MODEL_CONFIG_MAPPING
 from bfcl_eval.utils import *
@@ -252,6 +253,7 @@ def ast_file_runner(
     test_category,
     model_name,
     score_dir,
+    judge_model=None,
 ):
     assert (
         len(model_result) == len(prompt) == len(possible_answer)
@@ -304,14 +306,23 @@ def ast_file_runner(
             )
             continue
 
-        checker_result = ast_checker(
-            prompt_item,
-            model_result_item,
-            possible_answer_item,
-            language,
-            test_category,
-            model_name,
-        )
+        # Use LLM judge if specified, otherwise use AST checker
+        if judge_model:
+            checker_result = llm_judge_checker(
+                prompt_item,
+                model_result_item,
+                possible_answer_item,
+                judge_model,
+            )
+        else:
+            checker_result = ast_checker(
+                prompt_item,
+                model_result_item,
+                possible_answer_item,
+                language,
+                test_category,
+                model_name,
+            )
 
         if checker_result["valid"]:
             correct_count += 1
@@ -346,7 +357,7 @@ def ast_file_runner(
 
 
 #### Main runner function ####
-def runner(model_names, test_categories, result_dir, score_dir):
+def runner(model_names, test_categories, result_dir, score_dir, judge_model=None):
 
     # State udpated by each eval subtask.
     state = dict(
@@ -395,6 +406,7 @@ def runner(model_names, test_categories, result_dir, score_dir):
                 model_name,
                 handler,
                 state,
+                judge_model,
             )
 
     # This function reads all the score files from local folder and updates the
@@ -415,6 +427,7 @@ def evaluate_task(
     model_name,
     handler,
     state,
+    judge_model=None,
 ):
 
     language = "Python"
@@ -463,6 +476,7 @@ def evaluate_task(
                 test_category,
                 model_name,
                 score_dir,
+                judge_model,
             )
 
     record_result(state["leaderboard_table"], model_name, test_category, accuracy, total_count)
@@ -471,7 +485,7 @@ def evaluate_task(
     return state
 
 
-def main(model, test_categories, result_dir, score_dir):
+def main(model, test_categories, result_dir, score_dir, judge_model=None):
     if result_dir is None:
         result_dir = RESULT_PATH
     else:
@@ -499,7 +513,7 @@ def main(model, test_categories, result_dir, score_dir):
             model_names.append(model_name.replace("/", "_"))
 
     # Driver function to run the evaluation for all categories involved.
-    runner(model_names, all_test_categories, result_dir, score_dir)
+    runner(model_names, all_test_categories, result_dir, score_dir, judge_model)
 
     print(
         f"🏁 Evaluation completed. See {score_dir / 'data_overall.csv'} for overall evaluation results on BFCL V3."

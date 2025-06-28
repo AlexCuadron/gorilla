@@ -251,13 +251,18 @@ def evaluate(
         "--score-dir",
         help="Relative path to the evaluation score folder, if different from the default; Path should be relative to the `berkeley-function-call-leaderboard` root folder",
     ),
+    judge_model: str = typer.Option(
+        None,
+        "--judge",
+        help="Use LLM judge for evaluation. Specify the judge model (e.g., gpt-4, gpt-3.5-turbo). The judge will be EXTREMELY CRITICAL about function names, parameters, types, and order.",
+    ),
 ):
     """
     Evaluate results from run of one or more models on a test-category (same as eval_runner.py).
     """
 
     load_dotenv(dotenv_path=DOTENV_PATH, verbose=True, override=True)  # Load the .env file
-    evaluation_main(model, test_category, result_dir, score_dir)
+    evaluation_main(model, test_category, result_dir, score_dir, judge_model)
 
 
 @cli.command()
