@@ -23,10 +23,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 import openai
 from tqdm import tqdm
 import argparse
+import concurrent.futures
+import threading
 import time
+from functools import partial
 
 class ToolScalingBenchmarkEfficient:
-    def __init__(self, data_dir: str, cache_dir: str = None, batch_size: int = 100):
+    def __init__(self, data_dir: str, cache_dir: str = None, batch_size: int = 200):
         """
         Initialize the Tool Scaling Benchmark generator.
         
@@ -405,10 +408,48 @@ class ToolScalingBenchmarkEfficient:
         print(f"   APIBench: {apibench_tools:,}")
         print(f"   API directory: {api_tools:,}")
         
-        return all_tools
+        # Final deduplication check to ensure absolutely no duplicates
+        print(f"🔍 Performing final deduplication check...")
+        final_tools = []
+        final_seen_hashes = set()
+        
+        for tool in all_tools:
+            tool_hash = self._get_tool_hash(tool)
+            if tool_hash not in final_seen_hashes:
+                final_seen_hashes.add(tool_hash)
+                final_tools.append(tool)
+        
+        removed_duplicates = len(all_tools) - len(final_tools)
+        if removed_duplicates > 0:
+            print(f"🧹 Removed {removed_duplicates} additional duplicate tools")
+        
+        print(f"✅ Final unique tool count: {len(final_tools):,}")
+        return final_tools
     
+    def _process_batch_parallel(self, batch_data: Tuple[List[str], List[str], int]) -> Tuple[List[str], List[np.ndarray], int]:
+        """Process a single batch of embeddings in parallel."""
+        batch_texts, batch_hashes, batch_idx = batch_data
+        
+        try:
+            batch_embeddings = self._get_embeddings_batch(batch_texts)
+            return batch_hashes, batch_embeddings, batch_idx
+        except Exception as e:
+            print(f"❗️ Error processing batch {batch_idx}: {e}")
+            # Fall back to individual processing
+            individual_embeddings = []
+            for text in batch_texts:
+                try:
+                    embedding = self._get_embeddings_batch([text])[0]
+                    individual_embeddings.append(embedding)
+                    time.sleep(0.05)  # Shorter delay for individual requests
+                except Exception as e2:
+                    print(f"❗️ Error processing individual text: {e2}")
+                    # Use zero embedding as fallback
+                    individual_embeddings.append(np.zeros(3072))  # text-embedding-3-large dimension
+            return batch_hashes, individual_embeddings, batch_idx
+
     def compute_tool_embeddings(self, tools: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
-        """Compute embeddings for all tools using batched API calls."""
+        """Compute embeddings for all tools using parallel batched API calls."""
         tool_embeddings = {}
         
         # Prepare data for batching
@@ -428,34 +469,55 @@ class ToolScalingBenchmarkEfficient:
         
         print(f"🧮 Computing embeddings for {len(tools_to_process)} new tools")
         
-        # Process in batches
-        for i in tqdm(range(0, len(tool_texts_to_process), self.batch_size), 
-                     desc="Computing tool embeddings"):
+        if not tools_to_process:
+            return tool_embeddings
+        
+        # Prepare batches for parallel processing
+        batches = []
+        for i in range(0, len(tool_texts_to_process), self.batch_size):
             batch_texts = tool_texts_to_process[i:i+self.batch_size]
             batch_hashes = tool_hashes_to_process[i:i+self.batch_size]
+            batches.append((batch_texts, batch_hashes, i // self.batch_size))
+        
+        print(f"🚀 Processing {len(batches)} batches in parallel with {min(8, len(batches))} workers")
+        
+        # Process batches in parallel with rate limiting
+        max_workers = min(8, len(batches))  # Limit concurrent requests to avoid rate limits
+        completed_batches = 0
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all batches
+            future_to_batch = {executor.submit(self._process_batch_parallel, batch): batch 
+                             for batch in batches}
             
-            if batch_texts:
-                try:
-                    batch_embeddings = self._get_embeddings_batch(batch_texts)
-                    
-                    for hash_key, embedding in zip(batch_hashes, batch_embeddings):
-                        tool_embeddings[hash_key] = embedding
-                        self.tool_embeddings_cache[hash_key] = embedding
-                    
-                    # Add a small delay to respect rate limits
-                    time.sleep(0.1)
-                    
-                except Exception as e:
-                    print(f"❗️ Error processing batch {i//self.batch_size}: {e}")
-                    # Fall back to individual processing for this batch
-                    for j, (text, hash_key) in enumerate(zip(batch_texts, batch_hashes)):
-                        try:
-                            embedding = self._get_embeddings_batch([text])[0]
+            # Process completed batches with progress bar
+            with tqdm(total=len(batches), desc="Computing tool embeddings") as pbar:
+                for future in concurrent.futures.as_completed(future_to_batch):
+                    try:
+                        batch_hashes, batch_embeddings, batch_idx = future.result()
+                        
+                        # Store embeddings
+                        for hash_key, embedding in zip(batch_hashes, batch_embeddings):
                             tool_embeddings[hash_key] = embedding
                             self.tool_embeddings_cache[hash_key] = embedding
-                            time.sleep(0.1)
-                        except Exception as e2:
-                            print(f"❗️ Error processing individual tool {hash_key}: {e2}")
+                        
+                        completed_batches += 1
+                        pbar.update(1)
+                        
+                        # Save cache periodically to avoid losing progress
+                        if completed_batches % 10 == 0:
+                            self._save_caches()
+                        
+                        # Rate limiting: small delay between batch completions
+                        time.sleep(0.1)
+                        
+                    except Exception as e:
+                        print(f"❗️ Error processing batch: {e}")
+                        pbar.update(1)
+        
+        # Final cache save
+        self._save_caches()
+        print(f"✅ Completed embedding computation for {len(tools_to_process)} tools")
         
         return tool_embeddings
     
@@ -535,15 +597,17 @@ class ToolScalingBenchmarkEfficient:
     def find_top_k_tools(self, query_embedding: np.ndarray, tool_embeddings: Dict[str, np.ndarray], 
                         tools: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
         """Find top-k most similar tools for a query."""
-        # Prepare tool embeddings matrix
+        # Prepare tool embeddings matrix and mappings efficiently
         tool_hashes = []
         embeddings_matrix = []
+        hash_to_tool = {}
         
         for tool in tools:
             tool_hash = self._get_tool_hash(tool)
             if tool_hash in tool_embeddings:
                 tool_hashes.append(tool_hash)
                 embeddings_matrix.append(tool_embeddings[tool_hash])
+                hash_to_tool[tool_hash] = tool
         
         if not embeddings_matrix:
             return tools[:k]  # Fallback if no embeddings
@@ -560,13 +624,32 @@ class ToolScalingBenchmarkEfficient:
         # Sort by similarity (descending)
         sorted_indices = np.argsort(similarities)[::-1]
         
-        # Get top-k tools
+        # Get top-k tools using pre-computed mapping
         top_k_tools = []
-        tool_hash_to_tool = {self._get_tool_hash(tool): tool for tool in tools}
-        
         for i in sorted_indices[:k]:
             tool_hash = tool_hashes[i]
-            top_k_tools.append(tool_hash_to_tool[tool_hash])
+            top_k_tools.append(hash_to_tool[tool_hash])
+        
+        return top_k_tools
+    
+    def _find_top_k_tools_optimized(self, query_embedding: np.ndarray, embeddings_matrix: np.ndarray,
+                                   tool_hashes: List[str], hash_to_tool: Dict[str, Dict[str, Any]], 
+                                   k: int) -> List[Dict[str, Any]]:
+        """Optimized version that uses pre-computed embeddings matrix."""
+        # Compute cosine similarities all at once
+        similarities = cosine_similarity(
+            query_embedding.reshape(1, -1),
+            embeddings_matrix
+        )[0]
+        
+        # Sort by similarity (descending)
+        sorted_indices = np.argsort(similarities)[::-1]
+        
+        # Get top-k tools using pre-computed mapping
+        top_k_tools = []
+        for i in sorted_indices[:k]:
+            tool_hash = tool_hashes[i]
+            top_k_tools.append(hash_to_tool[tool_hash])
         
         return top_k_tools
     
@@ -591,15 +674,33 @@ class ToolScalingBenchmarkEfficient:
         # Step 4: Compute query embeddings
         query_embeddings = self.compute_query_embeddings(queries)
         
-        # Step 5: Generate new benchmark
+        # Step 5: Pre-compute tool embeddings matrix for efficiency
+        print("🔧 Pre-computing tool embeddings matrix...")
+        tool_hashes = []
+        embeddings_matrix = []
+        hash_to_tool = {}
+        
+        for tool in all_tools:
+            tool_hash = self._get_tool_hash(tool)
+            if tool_hash in tool_embeddings:
+                tool_hashes.append(tool_hash)
+                embeddings_matrix.append(tool_embeddings[tool_hash])
+                hash_to_tool[tool_hash] = tool
+        
+        embeddings_matrix = np.array(embeddings_matrix)
+        print(f"📊 Pre-computed matrix shape: {embeddings_matrix.shape}")
+        
+        # Step 6: Generate new benchmark
         print("📝 Generating new benchmark file...")
         with open(output_file, 'w') as f:
             for query_data in tqdm(queries, desc="Processing queries"):
                 query_id = query_data['id']
                 query_embedding = query_embeddings[query_id]
                 
-                # Find top-k tools for this query
-                top_k_tools = self.find_top_k_tools(query_embedding, tool_embeddings, all_tools, num_tools)
+                # Find top-k tools for this query using pre-computed matrix
+                top_k_tools = self._find_top_k_tools_optimized(
+                    query_embedding, embeddings_matrix, tool_hashes, hash_to_tool, num_tools
+                )
                 
                 # Create new test case
                 new_test_case = {
