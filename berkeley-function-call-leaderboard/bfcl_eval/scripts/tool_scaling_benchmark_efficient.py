@@ -101,57 +101,310 @@ class ToolScalingBenchmarkEfficient:
             raise
     
     def _tool_to_text(self, tool: Dict[str, Any]) -> str:
-        """Convert a tool definition to text for embedding."""
-        name = tool.get('name', '')
-        description = tool.get('description', '')
-        parameters = tool.get('parameters', {})
+        """Convert a tool definition to text for embedding, handling multiple formats."""
+        text_parts = []
         
-        # Create a comprehensive text representation
-        text_parts = [f"Function: {name}"]
+        # Handle different tool formats from various datasets
         
-        if description:
-            text_parts.append(f"Description: {description}")
+        # 1. BFCL format: {name, description, parameters}
+        if 'name' in tool and 'description' in tool:
+            name = tool.get('name', '')
+            description = tool.get('description', '')
+            parameters = tool.get('parameters', {})
+            
+            text_parts.append(f"Function: {name}")
+            if description:
+                text_parts.append(f"Description: {description}")
+            
+            if parameters and 'properties' in parameters:
+                text_parts.append("Parameters:")
+                for param_name, param_info in parameters['properties'].items():
+                    param_desc = param_info.get('description', '')
+                    param_type = param_info.get('type', '')
+                    text_parts.append(f"- {param_name} ({param_type}): {param_desc}")
         
-        if parameters and 'properties' in parameters:
-            text_parts.append("Parameters:")
-            for param_name, param_info in parameters['properties'].items():
-                param_desc = param_info.get('description', '')
-                param_type = param_info.get('type', '')
-                text_parts.append(f"- {param_name} ({param_type}): {param_desc}")
+        # 2. APIZoo format: {api_name, api_call, functionality, meta_data}
+        elif 'api_name' in tool:
+            api_name = tool.get('api_name', '')
+            api_call = tool.get('api_call', '')
+            functionality = tool.get('functionality', '')
+            meta_data = tool.get('meta_data', {})
+            
+            text_parts.append(f"API: {api_name}")
+            if api_call:
+                text_parts.append(f"Call: {api_call}")
+            if functionality:
+                text_parts.append(f"Functionality: {functionality}")
+            if isinstance(meta_data, dict) and 'description' in meta_data:
+                text_parts.append(f"Description: {meta_data['description']}")
+        
+        # 3. APIBench format: {api_call, api_data, provider}
+        elif 'api_call' in tool and 'api_data' in tool:
+            api_call = tool.get('api_call', '')
+            api_data = tool.get('api_data', {})
+            provider = tool.get('provider', '')
+            
+            text_parts.append(f"API Call: {api_call}")
+            if provider:
+                text_parts.append(f"Provider: {provider}")
+            
+            if isinstance(api_data, dict):
+                domain = api_data.get('domain', '')
+                functionality = api_data.get('functionality', '')
+                description = api_data.get('description', '')
+                
+                if domain:
+                    text_parts.append(f"Domain: {domain}")
+                if functionality:
+                    text_parts.append(f"Functionality: {functionality}")
+                if description:
+                    text_parts.append(f"Description: {description}")
+        
+        # 4. OpenFunctions format: {name, api_call, description, parameters}
+        elif 'api_call' in tool:
+            name = tool.get('name', '')
+            api_call = tool.get('api_call', '')
+            description = tool.get('description', '')
+            parameters = tool.get('parameters', {})
+            
+            if name:
+                text_parts.append(f"Function: {name}")
+            text_parts.append(f"API Call: {api_call}")
+            if description:
+                text_parts.append(f"Description: {description}")
+            
+            if isinstance(parameters, dict) and 'properties' in parameters:
+                text_parts.append("Parameters:")
+                for param_name, param_info in parameters['properties'].items():
+                    param_desc = param_info.get('description', '')
+                    param_type = param_info.get('type', '')
+                    text_parts.append(f"- {param_name} ({param_type}): {param_desc}")
+        
+        # 5. Generic fallback - try to extract any useful text
+        else:
+            # Look for common fields that might contain useful information
+            for key in ['name', 'api_name', 'function_name', 'title']:
+                if key in tool and tool[key]:
+                    text_parts.append(f"Name: {tool[key]}")
+                    break
+            
+            for key in ['description', 'summary', 'functionality', 'purpose']:
+                if key in tool and tool[key]:
+                    text_parts.append(f"Description: {tool[key]}")
+                    break
+            
+            for key in ['api_call', 'call', 'usage', 'example']:
+                if key in tool and tool[key]:
+                    text_parts.append(f"Usage: {tool[key]}")
+                    break
+        
+        # If we couldn't extract anything meaningful, use the entire tool as text
+        if not text_parts:
+            text_parts.append(str(tool))
         
         return " ".join(text_parts)
     
     def aggregate_all_tools(self) -> List[Dict[str, Any]]:
-        """Aggregate all tools from all BFCL test files."""
+        """Aggregate all tools from ALL Gorilla datasets."""
+        import ast
+        from pathlib import Path
+        
         all_tools = []
         seen_tools = set()
         
-        # Get all JSON files in the data directory (exclude our generated ones)
-        json_files = [f for f in self.data_dir.glob("BFCL_v3_*.json") 
-                     if not f.name.startswith("BFCL_v3_tool_scaling")]
+        print(f"🔍 Aggregating tools from ALL Gorilla datasets...")
         
-        print(f"🔍 Found {len(json_files)} BFCL test files")
+        # 1. BFCL files from berkeley-function-call-leaderboard
+        bfcl_files = []
+        for pattern in ['**/*.json']:
+            files = list(self.data_dir.glob(pattern))
+            bfcl_files.extend([f for f in files if 'BFCL_v3_' in f.name and not f.name.startswith('BFCL_v3_tool_scaling')])
         
-        for json_file in json_files:
-            print(f"📄 Processing {json_file.name}")
-            
-            with open(json_file, 'r') as f:
-                for line in f:
-                    try:
-                        test_case = json.loads(line.strip())
-                        functions = test_case.get('function', [])
-                        
-                        for func in functions:
-                            # Create a unique identifier for the tool
-                            tool_hash = self._get_tool_hash(func)
+        print(f"📄 Processing {len(bfcl_files)} BFCL files...")
+        bfcl_tools = 0
+        for json_file in bfcl_files:
+            try:
+                with open(json_file, 'r') as f:
+                    for line in f:
+                        try:
+                            test_case = json.loads(line.strip())
+                            functions = test_case.get('function', [])
                             
-                            if tool_hash not in seen_tools:
-                                seen_tools.add(tool_hash)
-                                all_tools.append(func)
-                    except json.JSONDecodeError:
-                        continue
+                            for func in functions:
+                                tool_hash = self._get_tool_hash(func)
+                                if tool_hash not in seen_tools:
+                                    seen_tools.add(tool_hash)
+                                    all_tools.append(func)
+                                    bfcl_tools += 1
+                        except:
+                            continue
+            except Exception as e:
+                print(f"❗️ Error processing {json_file}: {e}")
         
-        print(f"🔧 Aggregated {len(all_tools)} unique tools")
+        # 2. Multi-turn func doc files
+        func_doc_dir = self.data_dir / 'multi_turn_func_doc'
+        func_doc_tools = 0
+        if func_doc_dir.exists():
+            func_doc_files = list(func_doc_dir.glob('*.json'))
+            print(f"📄 Processing {len(func_doc_files)} func_doc files...")
+            for json_file in func_doc_files:
+                try:
+                    with open(json_file, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                try:
+                                    tool = json.loads(line)
+                                    if 'name' in tool:
+                                        tool_hash = self._get_tool_hash(tool)
+                                        if tool_hash not in seen_tools:
+                                            seen_tools.add(tool_hash)
+                                            all_tools.append(tool)
+                                            func_doc_tools += 1
+                                except:
+                                    pass
+                except Exception as e:
+                    print(f"❗️ Error processing {json_file}: {e}")
+        
+        # 3. OpenFunctions datasets (if available)
+        gorilla_root = self.data_dir.absolute().parent.parent.parent  # Go up to gorilla root
+        openfunctions_dir = gorilla_root / 'openfunctions' / 'openfunctions-v1'
+        openfunctions_tools = 0
+        if openfunctions_dir.exists():
+            print(f"📄 Processing OpenFunctions datasets...")
+            
+            # Test file
+            test_file = openfunctions_dir / 'gorilla_openfunctions_v1_test.json'
+            if test_file.exists():
+                try:
+                    with open(test_file, 'r') as f:
+                        data = json.load(f)
+                        for entry in data:
+                            if 'function' in entry:
+                                func = entry['function']
+                                tool_hash = self._get_tool_hash(func)
+                                if tool_hash not in seen_tools:
+                                    seen_tools.add(tool_hash)
+                                    all_tools.append(func)
+                                    openfunctions_tools += 1
+                except Exception as e:
+                    print(f"❗️ Error processing OpenFunctions test: {e}")
+            
+            # Train file (JSONL format)
+            train_file = openfunctions_dir / 'gorilla_openfunctions_v1_train.json'
+            if train_file.exists():
+                try:
+                    with open(train_file, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                try:
+                                    data = json.loads(line)
+                                    if 'Functions' in data:
+                                        functions = data['Functions']
+                                        for func_str in functions:
+                                            try:
+                                                func = ast.literal_eval(func_str)
+                                                tool_hash = self._get_tool_hash(func)
+                                                if tool_hash not in seen_tools:
+                                                    seen_tools.add(tool_hash)
+                                                    all_tools.append(func)
+                                                    openfunctions_tools += 1
+                                            except:
+                                                pass
+                                except:
+                                    pass
+                except Exception as e:
+                    print(f"❗️ Error processing OpenFunctions train: {e}")
+        
+        # 4. APIZoo datasets
+        apizoo_dir = gorilla_root / 'data' / 'apizoo'
+        apizoo_tools = 0
+        if apizoo_dir.exists():
+            apizoo_files = list(apizoo_dir.glob('*.json')) + list(apizoo_dir.glob('*.JSON'))
+            print(f"📄 Processing {len(apizoo_files)} APIZoo files...")
+            for json_file in apizoo_files:
+                try:
+                    with open(json_file, 'r') as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            for item in data:
+                                if 'api_name' in item or 'api_call' in item:
+                                    tool_hash = self._get_tool_hash(item)
+                                    if tool_hash not in seen_tools:
+                                        seen_tools.add(tool_hash)
+                                        all_tools.append(item)
+                                        apizoo_tools += 1
+                        elif isinstance(data, dict):
+                            if 'api_name' in data or 'api_call' in data:
+                                tool_hash = self._get_tool_hash(data)
+                                if tool_hash not in seen_tools:
+                                    seen_tools.add(tool_hash)
+                                    all_tools.append(data)
+                                    apizoo_tools += 1
+                except Exception as e:
+                    # Some files have JSON syntax errors, skip them
+                    pass
+        
+        # 5. APIBench datasets (JSONL format)
+        apibench_dir = gorilla_root / 'data' / 'apibench'
+        apibench_tools = 0
+        if apibench_dir.exists():
+            apibench_files = list(apibench_dir.glob('*.json'))
+            print(f"📄 Processing {len(apibench_files)} APIBench files...")
+            for json_file in apibench_files:
+                try:
+                    with open(json_file, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                try:
+                                    item = json.loads(line)
+                                    if any(key in item for key in ['api_call', 'api_data', 'provider']):
+                                        tool_hash = self._get_tool_hash(item)
+                                        if tool_hash not in seen_tools:
+                                            seen_tools.add(tool_hash)
+                                            all_tools.append(item)
+                                            apibench_tools += 1
+                                except:
+                                    pass
+                except Exception as e:
+                    print(f"❗️ Error processing {json_file}: {e}")
+        
+        # 6. API directory (JSONL format)
+        api_dir = gorilla_root / 'data' / 'api'
+        api_tools = 0
+        if api_dir.exists():
+            api_files = list(api_dir.glob('*.jsonl'))
+            print(f"📄 Processing {len(api_files)} API files...")
+            for jsonl_file in api_files:
+                try:
+                    with open(jsonl_file, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                try:
+                                    item = json.loads(line)
+                                    if any(key in item for key in ['api_call', 'api_name', 'name', 'function']):
+                                        tool_hash = self._get_tool_hash(item)
+                                        if tool_hash not in seen_tools:
+                                            seen_tools.add(tool_hash)
+                                            all_tools.append(item)
+                                            api_tools += 1
+                                except:
+                                    pass
+                except Exception as e:
+                    print(f"❗️ Error processing {jsonl_file}: {e}")
+        
+        print(f"🎉 Total unique tools aggregated: {len(all_tools):,}")
+        print(f"📊 Breakdown:")
+        print(f"   BFCL files: {bfcl_tools:,}")
+        print(f"   Func doc: {func_doc_tools:,}")
+        print(f"   OpenFunctions: {openfunctions_tools:,}")
+        print(f"   APIZoo: {apizoo_tools:,}")
+        print(f"   APIBench: {apibench_tools:,}")
+        print(f"   API directory: {api_tools:,}")
+        
         return all_tools
     
     def compute_tool_embeddings(self, tools: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
