@@ -40,3 +40,6 @@ berkeley-function-call-leaderboard/bfcl_eval/scripts/ground_truth_conversation/
 
 # Ignore embedding caches (large files)
 berkeley-function-call-leaderboard/bfcl_eval/data/embeddings_cache/
+
+# Ignore virtual environments
+berkeley-function-call-leaderboard/bfcl_env/
