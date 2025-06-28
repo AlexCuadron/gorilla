@@ -13,6 +13,8 @@ doesn't match the ground truth PERFECTLY.
 """
 
 import json
+import asyncio
+import concurrent.futures
 from typing import Dict, List, Any
 from bfcl_eval.constants.model_config import MODEL_CONFIG_MAPPING
 
@@ -101,18 +103,28 @@ Be EXTREMELY CRITICAL. If there's ANY doubt, mark it as invalid.
         """Evaluate a single function call using the LLM judge."""
         
         try:
+            print(f"🔍 Evaluating function call with judge model: {self.judge_model}")
+            
             # Create the evaluation prompt
             prompt = self.create_judge_prompt(ground_truth, model_output, available_functions)
             
+            print(f"📝 Created evaluation prompt (length: {len(prompt)} chars)")
+            
             # Get judgment from the LLM
+            print(f"🚀 Making API call to {self.judge_model}...")
             judgment = self._get_llm_judgment(prompt)
+            
+            print(f"✅ Received judgment (length: {len(judgment)} chars)")
             
             # Parse the judgment
             result = self._parse_judgment(judgment)
             
+            print(f"📊 Evaluation result: valid={result['valid']}")
+            
             return result
             
         except Exception as e:
+            print(f"❌ LLM Judge evaluation failed: {str(e)}")
             return {
                 "valid": False,
                 "errors": [f"LLM Judge evaluation failed: {str(e)}"],
@@ -121,7 +133,7 @@ Be EXTREMELY CRITICAL. If there's ANY doubt, mark it as invalid.
             }
     
     def _get_llm_judgment(self, prompt: str) -> str:
-        """Get judgment from the LLM judge model."""
+        """Get judgment from the LLM judge model with timeout."""
         
         try:
             # Create a simple test case for the judge
@@ -131,10 +143,14 @@ Be EXTREMELY CRITICAL. If there's ANY doubt, mark it as invalid.
                 "function": []  # No functions needed for judge
             }
             
-            # Get response from judge model
-            result, metadata = self.judge_handler.inference(test_case, False, False)
-            
-            return result
+            # Use ThreadPoolExecutor with timeout to prevent hanging
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self.judge_handler.inference, test_case, False, False)
+                try:
+                    result, metadata = future.result(timeout=30)  # 30 second timeout
+                    return result
+                except concurrent.futures.TimeoutError:
+                    raise Exception("LLM judge API call timed out after 30 seconds")
             
         except Exception as e:
             raise Exception(f"Failed to get LLM judgment: {str(e)}")
@@ -213,25 +229,29 @@ def llm_judge_checker(func_description: List[Dict[str, Any]], model_output: List
     
     # Handle multiple function calls (parallel/multiple)
     elif len(possible_answer) == len(model_output):
-        results = []
-        all_valid = True
-        all_errors = []
-        
-        for i, (gt, output) in enumerate(zip(possible_answer, model_output)):
-            result = judge.evaluate_function_call(
+        # Use parallel processing for multiple function calls
+        def evaluate_single(args):
+            gt, output = args
+            return judge.evaluate_function_call(
                 ground_truth=gt,
                 model_output=output,
                 available_functions=func_description
             )
-            
-            results.append(result)
-            all_valid = all_valid and result["valid"]
+        
+        # Process in parallel with ThreadPoolExecutor
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(possible_answer))) as executor:
+            args_list = list(zip(possible_answer, model_output))
+            results = list(executor.map(evaluate_single, args_list))
+        
+        all_valid = all(result["valid"] for result in results)
+        all_errors = []
+        for result in results:
             all_errors.extend(result["errors"])
         
         return {
             "valid": all_valid,
             "errors": all_errors,
-            "reasoning": f"Evaluated {len(results)} function calls",
+            "reasoning": f"Evaluated {len(results)} function calls in parallel",
             "individual_results": results,
             "error_type": "llm_judge:multiple_functions" if not all_valid else None
         }
