@@ -23,12 +23,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import openai
 from tqdm import tqdm
 import argparse
-import logging
 import time
-
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 class ToolScalingBenchmarkEfficient:
     def __init__(self, data_dir: str, cache_dir: str = None, batch_size: int = 100):
@@ -63,12 +58,12 @@ class ToolScalingBenchmarkEfficient:
         if tool_cache_file.exists():
             with open(tool_cache_file, 'rb') as f:
                 self.tool_embeddings_cache = pickle.load(f)
-            logger.info(f"Loaded {len(self.tool_embeddings_cache)} tool embeddings from cache")
+            print(f"📦 Loaded {len(self.tool_embeddings_cache)} tool embeddings from cache")
         
         if query_cache_file.exists():
             with open(query_cache_file, 'rb') as f:
                 self.query_embeddings_cache = pickle.load(f)
-            logger.info(f"Loaded {len(self.query_embeddings_cache)} query embeddings from cache")
+            print(f"📦 Loaded {len(self.query_embeddings_cache)} query embeddings from cache")
     
     def _save_caches(self):
         """Save embedding caches to disk."""
@@ -81,7 +76,7 @@ class ToolScalingBenchmarkEfficient:
         with open(query_cache_file, 'wb') as f:
             pickle.dump(self.query_embeddings_cache, f)
         
-        logger.info("Saved embedding caches to disk")
+        print("💾 Saved embedding caches to disk")
     
     def _get_tool_hash(self, tool: Dict[str, Any]) -> str:
         """Generate a hash for a tool to use as cache key."""
@@ -102,7 +97,7 @@ class ToolScalingBenchmarkEfficient:
             embeddings = [np.array(data.embedding) for data in response.data]
             return embeddings
         except Exception as e:
-            logger.error(f"Error getting embeddings for batch: {e}")
+            print(f"❗️ Error getting embeddings for batch: {e}")
             raise
     
     def _tool_to_text(self, tool: Dict[str, Any]) -> str:
@@ -135,10 +130,10 @@ class ToolScalingBenchmarkEfficient:
         json_files = [f for f in self.data_dir.glob("BFCL_v3_*.json") 
                      if not f.name.startswith("BFCL_v3_tool_scaling")]
         
-        logger.info(f"Found {len(json_files)} BFCL test files")
+        print(f"🔍 Found {len(json_files)} BFCL test files")
         
         for json_file in json_files:
-            logger.info(f"Processing {json_file.name}")
+            print(f"📄 Processing {json_file.name}")
             
             with open(json_file, 'r') as f:
                 for line in f:
@@ -156,7 +151,7 @@ class ToolScalingBenchmarkEfficient:
                     except json.JSONDecodeError:
                         continue
         
-        logger.info(f"Aggregated {len(all_tools)} unique tools")
+        print(f"🔧 Aggregated {len(all_tools)} unique tools")
         return all_tools
     
     def compute_tool_embeddings(self, tools: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
@@ -178,7 +173,7 @@ class ToolScalingBenchmarkEfficient:
                 tool_hashes_to_process.append(tool_hash)
                 tool_texts_to_process.append(self._tool_to_text(tool))
         
-        logger.info(f"Computing embeddings for {len(tools_to_process)} new tools")
+        print(f"🧮 Computing embeddings for {len(tools_to_process)} new tools")
         
         # Process in batches
         for i in tqdm(range(0, len(tool_texts_to_process), self.batch_size), 
@@ -198,7 +193,7 @@ class ToolScalingBenchmarkEfficient:
                     time.sleep(0.1)
                     
                 except Exception as e:
-                    logger.error(f"Error processing batch {i//self.batch_size}: {e}")
+                    print(f"❗️ Error processing batch {i//self.batch_size}: {e}")
                     # Fall back to individual processing for this batch
                     for j, (text, hash_key) in enumerate(zip(batch_texts, batch_hashes)):
                         try:
@@ -207,7 +202,7 @@ class ToolScalingBenchmarkEfficient:
                             self.tool_embeddings_cache[hash_key] = embedding
                             time.sleep(0.1)
                         except Exception as e2:
-                            logger.error(f"Error processing individual tool {hash_key}: {e2}")
+                            print(f"❗️ Error processing individual tool {hash_key}: {e2}")
         
         return tool_embeddings
     
@@ -224,7 +219,7 @@ class ToolScalingBenchmarkEfficient:
                 except json.JSONDecodeError:
                     continue
         
-        logger.info(f"Loaded {len(queries)} queries from BFCL_v3_simple.json")
+        print(f"📝 Loaded {len(queries)} queries from BFCL_v3_simple.json")
         return queries
     
     def compute_query_embeddings(self, queries: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
@@ -250,7 +245,7 @@ class ToolScalingBenchmarkEfficient:
                 query_texts_to_process.append(question)
                 query_hashes_to_process.append(query_hash)
         
-        logger.info(f"Computing embeddings for {len(queries_to_process)} new queries")
+        print(f"🧮 Computing embeddings for {len(queries_to_process)} new queries")
         
         # Process in batches
         for i in tqdm(range(0, len(query_texts_to_process), self.batch_size), 
@@ -271,7 +266,7 @@ class ToolScalingBenchmarkEfficient:
                     time.sleep(0.1)
                     
                 except Exception as e:
-                    logger.error(f"Error processing query batch {i//self.batch_size}: {e}")
+                    print(f"❗️ Error processing query batch {i//self.batch_size}: {e}")
                     # Fall back to individual processing for this batch
                     for j, (text, query_id, hash_key) in enumerate(zip(batch_texts, batch_ids, batch_hashes)):
                         try:
@@ -280,7 +275,7 @@ class ToolScalingBenchmarkEfficient:
                             self.query_embeddings_cache[hash_key] = embedding
                             time.sleep(0.1)
                         except Exception as e2:
-                            logger.error(f"Error processing individual query {query_id}: {e2}")
+                            print(f"❗️ Error processing individual query {query_id}: {e2}")
         
         return query_embeddings
     
@@ -329,7 +324,7 @@ class ToolScalingBenchmarkEfficient:
         else:
             output_file = Path(output_file)
         
-        logger.info(f"Generating tool scaling benchmark with {num_tools} tools")
+        print(f"🎯 Generating tool scaling benchmark with {num_tools} tools")
         
         # Step 1: Aggregate all tools
         all_tools = self.aggregate_all_tools()
@@ -344,7 +339,7 @@ class ToolScalingBenchmarkEfficient:
         query_embeddings = self.compute_query_embeddings(queries)
         
         # Step 5: Generate new benchmark
-        logger.info("Generating new benchmark file...")
+        print("📝 Generating new benchmark file...")
         with open(output_file, 'w') as f:
             for query_data in tqdm(queries, desc="Processing queries"):
                 query_id = query_data['id']
@@ -365,7 +360,7 @@ class ToolScalingBenchmarkEfficient:
         # Save caches
         self._save_caches()
         
-        logger.info(f"Generated benchmark saved to {output_file}")
+        print(f"✅ Generated benchmark saved to {output_file}")
         return str(output_file)
 
 
@@ -386,7 +381,7 @@ def main():
     
     # Check if OpenAI API key is set
     if not os.getenv('OPENAI_API_KEY'):
-        logger.error("OPENAI_API_KEY environment variable not set")
+        print("❗️ OPENAI_API_KEY environment variable not set")
         return
     
     # Create benchmark generator
@@ -395,7 +390,7 @@ def main():
     # Generate benchmark
     output_file = benchmark.generate_benchmark(args.num_tools, args.output_file)
     
-    print(f"Tool scaling benchmark generated: {output_file}")
+    print(f"🎉 Tool scaling benchmark generated: {output_file}")
 
 
 if __name__ == "__main__":
