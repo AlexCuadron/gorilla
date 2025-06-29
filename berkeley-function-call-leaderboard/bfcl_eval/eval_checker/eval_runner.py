@@ -301,6 +301,7 @@ def evaluate_single_test_case(args):
             model_result_content,
             possible_answer_item,
             judge_model,
+            available_functions=prompt_item["function"]
         )
     else:
         checker_result = ast_checker(

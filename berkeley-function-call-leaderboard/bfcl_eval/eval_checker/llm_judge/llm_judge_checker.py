@@ -37,16 +37,20 @@ class LLMJudgeChecker:
         else:
             raise ValueError(f"Judge model '{judge_model}' not found in MODEL_CONFIG_MAPPING")
     
-    def create_judge_prompt(self, ground_truth: Dict[str, Any], model_output: Any) -> str:
-        """Create an extremely critical evaluation prompt for the LLM judge."""
+    def create_judge_prompt(self, ground_truth: Dict[str, Any], model_output: Any, available_functions: List[Dict] = None) -> str:
+        """Create an intelligent evaluation prompt for the LLM judge."""
 
-        prompt = f"""You are an EXTREMELY CRITICAL function calling evaluator. Your job is to determine if a model's function call output matches the expected ground truth.
+        # Format available functions for context
+        functions_context = ""
+        if available_functions:
+            functions_context = f"""
 
-You must be EXTREMELY STRICT about:
-1. **Function Name**: Must match EXACTLY (case-sensitive, no variations allowed)
-2. **Parameter Names**: Must match EXACTLY (case-sensitive, no variations allowed)  
-3. **Parameter Types**: Must match the expected types EXACTLY
-4. **Parameter Values**: Must match the expected values EXACTLY or be in the allowed list
+**AVAILABLE FUNCTIONS (for semantic matching):**
+```json
+{json.dumps(available_functions, indent=2)}
+```"""
+
+        prompt = f"""You are an intelligent function calling evaluator. Your job is to determine if a model's function call output is semantically equivalent to the expected ground truth.
 
 **GROUND TRUTH (Expected Output):**
 ```json
@@ -56,49 +60,68 @@ You must be EXTREMELY STRICT about:
 **MODEL OUTPUT (Actual Output):**
 ```json
 {json.dumps(model_output)}
-```
+```{functions_context}
 
 **EVALUATION CRITERIA:**
 
 1. **Function Name Matching**: 
-   - The function name must be semantically similar to the ground truth
-   - No synonyms, abbreviations, or variations are acceptable
-   - Case sensitivity matters
+   - Function names should be semantically equivalent (e.g., "calculate_triangle_area" ≈ "calc_area_triangle")
+   - Check against available functions to find the best match
+   - Consider synonyms and common variations (e.g., "final_speed" ≈ "final_velocity")
+   - Case variations are acceptable
 
 2. **Parameter Validation**:
-   - Every required parameter must be present
-   - Parameter names must match EXACTLY
-   - Parameter values must be in the allowed list from ground truth
-   - If ground truth shows multiple possible values like [10, "10"], any of those values is acceptable
+   - Required parameters must be present with correct values
+   - Parameter names can have semantic variations (e.g., "interest_rate" ≈ "rate")
+   - Values should be equivalent (e.g., 0.05 = 5% as decimal)
+   - If ground truth shows multiple possible values like [10, "10", ""], any of those values is acceptable
+   - Empty string "" in ground truth means the parameter is optional
+   - Lists in ground truth indicate multiple acceptable values
 
-3. **No Extra Parameters**:
-   - The model should not include parameters not in ground truth
-   - Only parameters that are in the ground truth are allowed
+3. **Parameter Format Flexibility**:
+   - Accept equivalent representations: dict vs individual parameters
+   - Handle nested structures appropriately
+   - Consider default values (e.g., n=1 for compounding frequency)
+
+4. **Units and Optional Parameters**:
+   - If units are specified in ground truth but missing in model output, it's INVALID
+   - If units are optional (empty string in ground truth), missing units are acceptable
+   - Optional parameters can be omitted or included
+
+**EXAMPLES:**
+
+✅ VALID: 
+- math.factorial(number=5) ≈ {{"math.factorial": {{"number": [5]}}}}
+- calculate_final_velocity(height=100, gravity=9.81) ≈ {{"calculate_final_speed": {{"height": [100], "gravity": [9.8, ""]}}}}
+- calculate_compound_interest({{'principal': 5000, 'rate': 0.05, 'time': 10, 'n': 1}}) ≈ {{"calculate_compounded_interest": {{"principal": [5000], "interest_rate": [0.05], "period": [10], "compounding_frequency": ["Annually", ""]}}}}
+
+❌ INVALID:
+- calc_area_triangle(base=10, height=5) ≠ {{"calculate_triangle_area": {{"base": [10], "height": [5], "unit": ["units", ""]}}}} (missing required units)
 
 **RESPONSE FORMAT:**
 You must respond with ONLY a JSON object:
 {{
     "valid": true/false,
-    "reasoning": "detailed explanation of your evaluation"
+    "reasoning": "detailed explanation of your evaluation including function matching, parameter equivalence, and any missing required fields"
 }}
 
 **SCORING GUIDELINES:**
-- valid: true - Perfect match in function name and all parameters
-- valid: false - Any mismatch in function name or parameters
+- valid: true - Semantically equivalent function call with all required parameters
+- valid: false - Missing required parameters, incompatible function, or significant semantic mismatch
 
-Be EXTREMELY CRITICAL. If there's ANY doubt, mark it as invalid.
+Be intelligent and flexible while ensuring functional correctness.
 """
         
         return prompt
     
-    def evaluate_function_call(self, ground_truth: Dict[str, Any], model_output: Any) -> Dict[str, Any]:
+    def evaluate_function_call(self, ground_truth: Dict[str, Any], model_output: Any, available_functions: List[Dict] = None) -> Dict[str, Any]:
         """Evaluate a single function call using the LLM judge."""
         
         try:
             print(f"🔍 Evaluating function call with judge model: {self.judge_model}")
             
-            # Create the evaluation prompt
-            prompt = self.create_judge_prompt(ground_truth, model_output)
+            # Create the evaluation prompt with available functions context
+            prompt = self.create_judge_prompt(ground_truth, model_output, available_functions)
             
             print(f"📝 Created evaluation prompt (length: {len(prompt)} chars)")
             
@@ -194,15 +217,16 @@ Be EXTREMELY CRITICAL. If there's ANY doubt, mark it as invalid.
 
 
 def llm_judge_checker(model_output: List[Any], 
-                     possible_answer: List[Dict[str, Any]], judge_model: str = "gpt-4") -> Dict[str, Any]:
+                     possible_answer: List[Dict[str, Any]], judge_model: str = "gpt-4", 
+                     available_functions: List[Dict] = None) -> Dict[str, Any]:
     """
     Main function for LLM judge evaluation.
     
     Args:
-        func_description: Available function definitions
         model_output: Model's function call output
         possible_answer: Expected ground truth
         judge_model: Model to use as judge
+        available_functions: Available function definitions for semantic matching
         
     Returns:
         Evaluation result
@@ -215,7 +239,8 @@ def llm_judge_checker(model_output: List[Any],
     if len(possible_answer) == 1 and len(model_output) == 1:
         return judge.evaluate_function_call(
             ground_truth=possible_answer[0],
-            model_output=model_output[0]
+            model_output=model_output[0],
+            available_functions=available_functions
         )
     
     # Handle multiple function calls (parallel/multiple)
@@ -225,7 +250,8 @@ def llm_judge_checker(model_output: List[Any],
             gt, output = args
             return judge.evaluate_function_call(
                 ground_truth=gt,
-                model_output=output
+                model_output=output,
+                available_functions=available_functions
             )
         
         # Process in parallel with ThreadPoolExecutor
@@ -236,7 +262,8 @@ def llm_judge_checker(model_output: List[Any],
         all_valid = all(result["valid"] for result in results)
         all_errors = []
         for result in results:
-            all_errors.extend(result["errors"])
+            if "errors" in result:
+                all_errors.extend(result["errors"])
         
         return {
             "valid": all_valid,
