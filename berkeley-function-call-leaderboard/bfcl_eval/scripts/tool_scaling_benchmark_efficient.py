@@ -291,14 +291,32 @@ class ToolScalingBenchmarkEfficient:
             else:
                 normalized_tool['parameters'] = params
         
-        # 3. Hugging Face/API format: {api_call, provider, api_data}
-        elif 'api_call' in tool and 'api_data' in tool:
-            api_data = tool.get('api_data', {})
-            normalized_tool['name'] = api_data.get('api_name', tool.get('provider', 'unknown_function'))
-            normalized_tool['description'] = api_data.get('description', tool.get('code', ''))
+        # 3. Hugging Face/API format: {api_call, provider, api_data} or simple api_call format
+        elif 'api_call' in tool:
+            if 'api_data' in tool:
+                # Full Hugging Face format
+                api_data = tool.get('api_data', {})
+                normalized_tool['name'] = api_data.get('api_name', tool.get('provider', 'unknown_function'))
+                normalized_tool['description'] = api_data.get('description', tool.get('code', ''))
+            else:
+                # Simple api_call format - use existing name and description
+                normalized_tool['name'] = tool.get('name', 'unknown_function')
+                normalized_tool['description'] = tool.get('description', '')
             
-            # Extract parameters from api_arguments if available
-            api_args = api_data.get('api_arguments', [])
+            # Extract parameters from api_arguments if available (for Hugging Face format)
+            if 'api_data' in tool:
+                api_data = tool.get('api_data', {})
+                api_args = api_data.get('api_arguments', [])
+            else:
+                # For simple api_call format, use existing parameters if they're already correct
+                if ('parameters' in tool and isinstance(tool.get('parameters'), dict) and
+                    'properties' in tool.get('parameters', {}) and 
+                    tool.get('parameters', {}).get('type') == 'object'):
+                    normalized_tool['parameters'] = tool['parameters']
+                    return normalized_tool
+                else:
+                    api_args = []
+            
             if isinstance(api_args, list):
                 properties = {}
                 required = []
@@ -338,7 +356,36 @@ class ToolScalingBenchmarkEfficient:
                     'required': []
                 }
         
-        # 4. Generic fallback
+        # 4. Flat parameters format: {name, description, parameters: {param1: {type, description}, ...}}
+        elif ('name' in tool and 'description' in tool and 
+              'parameters' in tool and isinstance(tool.get('parameters'), dict) and
+              not ('type' in tool.get('parameters', {}) or 'properties' in tool.get('parameters', {}) or 
+                   'required' in tool.get('parameters', {}) or 'optional' in tool.get('parameters', {}))):
+            # Parameters are flat - convert to proper BFCL format
+            normalized_tool['name'] = tool['name']
+            normalized_tool['description'] = tool['description']
+            
+            flat_params = tool.get('parameters', {})
+            properties = {}
+            required = []
+            
+            for param_name, param_def in flat_params.items():
+                if isinstance(param_def, dict) and 'type' in param_def:
+                    properties[param_name] = {
+                        'type': param_def.get('type', 'string'),
+                        'description': param_def.get('description', '')
+                    }
+                    # For flat format, assume all parameters are required unless marked optional
+                    if not param_def.get('optional', False):
+                        required.append(param_name)
+            
+            normalized_tool['parameters'] = {
+                'type': 'object',
+                'properties': properties,
+                'required': required
+            }
+        
+        # 5. Generic fallback
         else:
             # Try to extract name from various fields
             name = None
