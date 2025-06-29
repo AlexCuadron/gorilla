@@ -1,4 +1,6 @@
 import argparse
+import concurrent.futures
+from functools import partial
 
 from bfcl_eval.constants.category_mapping import (
     TEST_COLLECTION_MAPPING,
@@ -244,6 +246,89 @@ def relevance_file_runner(
     return accuracy, len(model_result)
 
 
+def evaluate_single_test_case(args):
+    """
+    Evaluate a single test case. This function is designed to be used with parallel processing.
+    
+    Args:
+        args: Tuple containing (i, handler, model_result_item, prompt_item, possible_answer_item, 
+              language, test_category, model_name, judge_model)
+    
+    Returns:
+        Tuple of (index, result_dict, is_correct)
+    """
+    i, handler, model_result_item, prompt_item, possible_answer_item, language, test_category, model_name, judge_model = args
+    
+    index: str = model_result_item["id"]
+    model_result_content = model_result_item["result"]
+    
+    try:
+        model_result_content_raw = model_result_content
+        model_result_content = handler.decode_ast(model_result_content, language)
+    except Exception as e:
+        return i, {
+            "id": index,
+            "model_name": model_name,
+            "test_category": test_category,
+            "valid": False,
+            "error": [f"Invalid syntax. Failed to decode AST. {str(e)}"],
+            "error_type": "ast_decoder:decoder_failed",
+            "prompt": prompt_item,
+            "model_result_raw": model_result_content_raw,
+            "possible_answer": possible_answer_item,
+        }, False
+
+    decoder_output_valid = is_function_calling_format_output(model_result_content)
+    if not decoder_output_valid:
+        return i, {
+            "id": index,
+            "model_name": model_name,
+            "test_category": test_category,
+            "valid": False,
+            "error": [
+                "Did not output in the specified format. Note: the model_result is wrapped in a string to ensure json serializability."
+            ],
+            "error_type": "ast_decoder:decoder_wrong_output_format",
+            "prompt": prompt_item,
+            "model_result_raw": str(model_result_content_raw),
+            "model_result_decoded": str(model_result_content),
+            "possible_answer": possible_answer_item,
+        }, False
+
+    # Use LLM judge if specified, otherwise use AST checker
+    if judge_model:
+        checker_result = llm_judge_checker(
+            model_result_content,
+            possible_answer_item,
+            judge_model,
+        )
+    else:
+        checker_result = ast_checker(
+            prompt_item["function"],
+            model_result_content,
+            possible_answer_item,
+            language,
+            test_category,
+            model_name,
+        )
+
+    if checker_result["valid"]:
+        return i, None, True
+    else:
+        temp = {}
+        temp["id"] = index
+        temp["model_name"] = model_name
+        temp["test_category"] = test_category
+        temp["valid"] = checker_result["valid"]
+        temp["error"] = checker_result.get("reasoning", checker_result.get("error", []))
+        temp["error_type"] = checker_result["error_type"]
+        temp["prompt"] = prompt_item
+        temp["model_result_raw"] = model_result_content_raw
+        temp["model_result_decoded"] = model_result_content
+        temp["possible_answer"] = possible_answer_item
+        return i, temp, False
+
+
 def ast_file_runner(
     handler,
     model_result,
@@ -261,83 +346,83 @@ def ast_file_runner(
 
     result = []
     correct_count = 0
+    
+    # Prepare arguments for parallel processing
+    args_list = []
     for i in range(len(model_result)):
-        index: str = model_result[i]["id"]
-        model_result_item = model_result[i]["result"]
-        prompt_item = prompt[i]["function"]
-        possible_answer_item = possible_answer[i]["ground_truth"]
-
-        try:
-            model_result_item_raw = model_result_item
-            model_result_item = handler.decode_ast(model_result_item, language)
-        except Exception as e:
-            result.append(
-                {
-                    "id": index,
+        args_list.append((
+            i,
+            handler,
+            model_result[i],
+            prompt[i],
+            possible_answer[i]["ground_truth"],
+            language,
+            test_category,
+            model_name,
+            judge_model
+        ))
+    
+    # Use parallel processing if using LLM judge, otherwise process sequentially
+    if judge_model:
+        print(f"🚀 Processing {len(args_list)} test cases in parallel with LLM judge...")
+        
+        # Use ThreadPoolExecutor for parallel API calls
+        max_workers = min(8, len(args_list))  # Limit concurrent API calls
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_index = {executor.submit(evaluate_single_test_case, args): args[0] for args in args_list}
+            
+            # Process results as they complete
+            for future in tqdm(concurrent.futures.as_completed(future_to_index), 
+                             total=len(future_to_index), 
+                             desc="Evaluating with LLM judge"):
+                try:
+                    i, result_dict, is_correct = future.result()
+                    if is_correct:
+                        correct_count += 1
+                    elif result_dict:
+                        result.append(result_dict)
+                except Exception as e:
+                    print(f"❌ Error processing test case: {str(e)}")
+                    # Add error result for failed test case
+                    original_index = future_to_index[future]
+                    result.append({
+                        "id": model_result[original_index]["id"],
+                        "model_name": model_name,
+                        "test_category": test_category,
+                        "valid": False,
+                        "error": [f"Parallel processing error: {str(e)}"],
+                        "error_type": "parallel_processing:error",
+                        "prompt": prompt[original_index],
+                        "model_result_raw": model_result[original_index]["result"],
+                        "possible_answer": possible_answer[original_index]["ground_truth"],
+                    })
+        
+        print(f"✅ Completed parallel evaluation: {correct_count}/{len(model_result)} correct")
+    else:
+        # Sequential processing for AST checker (faster, no API calls)
+        print(f"🔄 Processing {len(args_list)} test cases sequentially with AST checker...")
+        
+        for args in tqdm(args_list, desc="Evaluating with AST checker"):
+            try:
+                i, result_dict, is_correct = evaluate_single_test_case(args)
+                if is_correct:
+                    correct_count += 1
+                elif result_dict:
+                    result.append(result_dict)
+            except Exception as e:
+                print(f"❌ Error processing test case {args[0]}: {str(e)}")
+                result.append({
+                    "id": model_result[args[0]]["id"],
                     "model_name": model_name,
                     "test_category": test_category,
                     "valid": False,
-                    "error": [f"Invalid syntax. Failed to decode AST. {str(e)}"],
-                    "error_type": "ast_decoder:decoder_failed",
-                    "prompt": prompt[i],
-                    "model_result_raw": model_result_item_raw,
-                    "possible_answer": possible_answer_item,
-                }
-            )
-            continue
-
-        decoder_output_valid = is_function_calling_format_output(model_result_item)
-        if not decoder_output_valid:
-            result.append(
-                {
-                    "id": index,
-                    "model_name": model_name,
-                    "test_category": test_category,
-                    "valid": False,
-                    "error": [
-                        "Did not output in the specified format. Note: the model_result is wrapped in a string to ensure json serializability."
-                    ],
-                    "error_type": "ast_decoder:decoder_wrong_output_format",
-                    "prompt": prompt[i],
-                    "model_result_raw": str(model_result_item_raw),
-                    "model_result_decoded": str(model_result_item),
-                    "possible_answer": possible_answer_item,
-                }
-            )
-            continue
-
-        # Use LLM judge if specified, otherwise use AST checker
-        if judge_model:
-            checker_result = llm_judge_checker(
-                model_result_item,
-                possible_answer_item,
-                judge_model,
-            )
-        else:
-            checker_result = ast_checker(
-                prompt_item,
-                model_result_item,
-                possible_answer_item,
-                language,
-                test_category,
-                model_name,
-            )
-
-        if checker_result["valid"]:
-            correct_count += 1
-        else:
-            temp = {}
-            temp["id"] = index
-            temp["model_name"] = model_name
-            temp["test_category"] = test_category
-            temp["valid"] = checker_result["valid"]
-            temp["error"] = checker_result.get("reasoning", checker_result.get("error", []))
-            temp["error_type"] = checker_result["error_type"]
-            temp["prompt"] = prompt[i]
-            temp["model_result_raw"] = model_result_item_raw
-            temp["model_result_decoded"] = model_result_item
-            temp["possible_answer"] = possible_answer_item
-            result.append(temp)
+                    "error": [f"Processing error: {str(e)}"],
+                    "error_type": "processing:error",
+                    "prompt": prompt[args[0]],
+                    "model_result_raw": model_result[args[0]]["result"],
+                    "possible_answer": possible_answer[args[0]]["ground_truth"],
+                })
 
     accuracy = correct_count / len(model_result)
     result.insert(
@@ -386,16 +471,21 @@ def runner(model_names, test_categories, result_dir, score_dir, judge_model=None
         # Find and process all JSON files in the subdirectory
         for model_result_json in subdir.glob("*.json"):
             test_category = extract_test_category(model_result_json)
+            print(f"📁 Found test file: {model_result_json.name} -> category: {test_category}")
+            
             if test_category not in test_categories:
+                print(f"⏭️  Skipping {test_category} (not in requested categories: {test_categories})")
                 continue
 
             handler = get_handler(model_name_escaped)
 
             # We don't evaluate the following categories in the current iteration of the benchmark
             if is_chatable(test_category) or is_sql(test_category) or is_executable(test_category):
+                print(f"⏭️  Skipping {test_category} (chatable/sql/executable)")
                 continue
 
             model_result = load_file(model_result_json, sort_by_id=True)
+            print(f"📊 Loaded {len(model_result)} test cases for {test_category}")
 
             state = evaluate_task(
                 test_category,
@@ -548,6 +638,12 @@ if __name__ == "__main__":
         type=str,
         help="Path to the folder where the evaluation score files will be stored; relative to the `berkeley-function-call-leaderboard` root folder",
     )
+    parser.add_argument(
+        "--judge",
+        default=None,
+        type=str,
+        help="Judge model to use for LLM-based evaluation (e.g., gpt-4, o3-mini-2025-01-31)",
+    )
 
     args = parser.parse_args()
 
@@ -557,4 +653,5 @@ if __name__ == "__main__":
         args.test_category,
         args.result_dir,
         args.score_dir,
+        args.judge,
     )
