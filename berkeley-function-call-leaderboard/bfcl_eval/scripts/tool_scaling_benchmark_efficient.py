@@ -216,8 +216,11 @@ class ToolScalingBenchmarkEfficient:
             'parameters' in tool and isinstance(tool.get('parameters'), dict)):
             return tool.copy()
         
-        # 2. APIZoo/RapidAPI format: {api_name, description, parameters}
-        elif 'api_name' in tool or ('name' in tool and 'parameters' in tool and isinstance(tool.get('parameters'), list)):
+        # 2. APIZoo/RapidAPI format: {api_name, description, parameters} or required/optional format
+        elif ('api_name' in tool or 
+              ('name' in tool and 'parameters' in tool and isinstance(tool.get('parameters'), list)) or
+              ('name' in tool and 'parameters' in tool and isinstance(tool.get('parameters'), dict) and 
+               ('required' in tool.get('parameters', {}) or 'optional' in tool.get('parameters', {})))):
             normalized_tool['name'] = tool.get('api_name', tool.get('name', 'unknown_function'))
             normalized_tool['description'] = tool.get('description', tool.get('functionality', ''))
             
@@ -236,6 +239,36 @@ class ToolScalingBenchmarkEfficient:
                         }
                         # Assume all parameters are required if not specified
                         required.append(param_name)
+                
+                normalized_tool['parameters'] = {
+                    'type': 'object',
+                    'properties': properties,
+                    'required': required
+                }
+            elif isinstance(params, dict) and ('required' in params or 'optional' in params):
+                # Handle required/optional format
+                properties = {}
+                required = []
+                
+                # Process required parameters
+                for param in params.get('required', []):
+                    if isinstance(param, dict) and 'name' in param:
+                        param_name = param['name']
+                        properties[param_name] = {
+                            'type': param.get('type', 'string').lower(),
+                            'description': param.get('description', '')
+                        }
+                        required.append(param_name)
+                
+                # Process optional parameters
+                for param in params.get('optional', []):
+                    if isinstance(param, dict) and 'name' in param and param['name'] != 'N/A':
+                        param_name = param['name']
+                        properties[param_name] = {
+                            'type': param.get('type', 'string').lower(),
+                            'description': param.get('description', '')
+                        }
+                        # Don't add to required list
                 
                 normalized_tool['parameters'] = {
                     'type': 'object',
