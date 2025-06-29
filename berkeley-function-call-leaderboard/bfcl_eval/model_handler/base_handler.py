@@ -1,4 +1,5 @@
 import json
+import random
 import time
 from copy import deepcopy
 
@@ -33,8 +34,32 @@ class BaseHandler:
         self.temperature = temperature
         self.is_fc_model = False  # Whether the model is a function calling model
 
+    def _randomize_tool_order_for_scaling(self, test_entry: dict) -> dict:
+        """
+        Randomize the order of tools for tool_scaling benchmarks to avoid bias.
+        Uses a fixed seed (42) for reproducibility.
+        """
+        test_entry_id = test_entry["id"]
+        
+        # Check if this is a tool_scaling benchmark
+        if "tool_scaling" in test_entry_id:
+            # Create a copy to avoid modifying the original
+            test_entry = deepcopy(test_entry)
+            
+            # Set seed for reproducible randomization
+            random.seed(42)
+            
+            # Randomize the function order
+            if "function" in test_entry and isinstance(test_entry["function"], list):
+                random.shuffle(test_entry["function"])
+                
+        return test_entry
+
     def inference(self, test_entry: dict, include_input_log: bool, exclude_state_log: bool):
         # This method is used to retrive model response for each model.
+
+        # Randomize tool order for tool_scaling benchmarks
+        test_entry = self._randomize_tool_order_for_scaling(test_entry)
 
         # FC model
         # TODO: Let all models have the is_fc_model attribute and remove the "FC" check

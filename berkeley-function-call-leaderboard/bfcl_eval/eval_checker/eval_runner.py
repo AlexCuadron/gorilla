@@ -1,4 +1,6 @@
 import argparse
+import concurrent.futures
+from functools import partial
 
 from bfcl_eval.constants.category_mapping import (
     TEST_COLLECTION_MAPPING,
@@ -19,11 +21,105 @@ from bfcl_eval.eval_checker.multi_turn_eval.multi_turn_checker import (
     multi_turn_checker,
     multi_turn_irrelevance_checker,
 )
+from bfcl_eval.eval_checker.llm_judge.llm_judge_checker import llm_judge_checker
 from bfcl_eval.eval_checker.multi_turn_eval.multi_turn_utils import is_empty_execute_response
 from bfcl_eval.constants.model_config import MODEL_CONFIG_MAPPING
 from bfcl_eval.utils import *
 from dotenv import load_dotenv
 from tqdm import tqdm
+import json
+import os
+
+
+def save_individual_comparison(comparison_data, score_dir, model_name, test_category):
+    """
+    Save individual comparison between AST and LLM judge to a separate file.
+    
+    Args:
+        comparison_data: Dictionary containing comparison results
+        score_dir: Base score directory path
+        model_name: Name of the model being evaluated
+        test_category: Test category name
+    """
+    # Create comparisons subdirectory
+    comparisons_dir = score_dir / model_name / "comparisons" / test_category
+    os.makedirs(comparisons_dir, exist_ok=True)
+    
+    # Generate filename based on test case ID
+    test_case_id = comparison_data.get("id", "unknown")
+    filename = f"{test_case_id}_comparison.json"
+    filepath = comparisons_dir / filename
+    
+    # Save the comparison data
+    with open(filepath, 'w') as f:
+        json.dump(comparison_data, f, indent=2, default=str)
+
+
+def save_comparison_summary(score_dir, model_name, test_category, ast_correct, llm_correct, 
+                          agreement_count, total_count, disagreements):
+    """
+    Save a summary of all comparisons for this test category.
+    
+    Args:
+        score_dir: Base score directory path
+        model_name: Name of the model being evaluated
+        test_category: Test category name
+        ast_correct: Number of cases AST checker marked as correct
+        llm_correct: Number of cases LLM judge marked as correct
+        agreement_count: Number of cases where AST and LLM agreed
+        total_count: Total number of test cases
+        disagreements: List of disagreement cases
+    """
+    # Create comparisons subdirectory
+    comparisons_dir = score_dir / model_name / "comparisons"
+    os.makedirs(comparisons_dir, exist_ok=True)
+    
+    # Create summary data
+    summary = {
+        "test_category": test_category,
+        "model_name": model_name,
+        "total_cases": total_count,
+        "ast_correct": ast_correct,
+        "llm_correct": llm_correct,
+        "agreement_count": agreement_count,
+        "disagreement_count": len(disagreements),
+        "ast_accuracy": ast_correct / total_count if total_count > 0 else 0,
+        "llm_accuracy": llm_correct / total_count if total_count > 0 else 0,
+        "agreement_rate": agreement_count / total_count if total_count > 0 else 0,
+        "disagreement_breakdown": {
+            "ast_valid_llm_invalid": 0,
+            "ast_invalid_llm_valid": 0
+        },
+        "disagreement_cases": []
+    }
+    
+    # Analyze disagreements
+    for disagreement in disagreements:
+        details = disagreement.get("disagreement_details", {})
+        case_summary = {
+            "id": disagreement.get("id"),
+            "ast_says": details.get("ast_says", "N/A"),
+            "llm_says": details.get("llm_says", "N/A"),
+            "ast_reasoning": disagreement.get("ast_reasoning", "")[:200] + "..." if len(disagreement.get("ast_reasoning", "")) > 200 else disagreement.get("ast_reasoning", ""),
+            "llm_reasoning": disagreement.get("llm_reasoning", "")[:200] + "..." if len(disagreement.get("llm_reasoning", "")) > 200 else disagreement.get("llm_reasoning", "")
+        }
+        summary["disagreement_cases"].append(case_summary)
+        
+        # Count disagreement types
+        if details.get("ast_says") == "VALID" and details.get("llm_says") == "INVALID":
+            summary["disagreement_breakdown"]["ast_valid_llm_invalid"] += 1
+        elif details.get("ast_says") == "INVALID" and details.get("llm_says") == "VALID":
+            summary["disagreement_breakdown"]["ast_invalid_llm_valid"] += 1
+    
+    # Save summary
+    summary_filename = f"{test_category}_comparison_summary.json"
+    summary_filepath = comparisons_dir / summary_filename
+    
+    with open(summary_filepath, 'w') as f:
+        json.dump(summary, f, indent=2, default=str)
+    
+    print(f"💾 Saved comparison summary to: {summary_filepath}")
+    print(f"💾 Individual comparisons saved to: {comparisons_dir / test_category}/")
 
 
 def get_handler(model_name):
@@ -243,6 +339,152 @@ def relevance_file_runner(
     return accuracy, len(model_result)
 
 
+def evaluate_single_test_case(args):
+    """
+    Evaluate a single test case. This function is designed to be used with parallel processing.
+    
+    Args:
+        args: Tuple containing (i, handler, model_result_item, prompt_item, possible_answer_item, 
+              language, test_category, model_name, judge_model)
+    
+    Returns:
+        Tuple of (index, result_dict, is_correct)
+    """
+    i, handler, model_result_item, prompt_item, possible_answer_item, language, test_category, model_name, judge_model = args
+    
+    index: str = model_result_item["id"]
+    model_result_content = model_result_item["result"]
+    
+    try:
+        model_result_content_raw = model_result_content
+        model_result_content = handler.decode_ast(model_result_content, language)
+    except Exception as e:
+        return i, {
+            "id": index,
+            "model_name": model_name,
+            "test_category": test_category,
+            "valid": False,
+            "error": [f"Invalid syntax. Failed to decode AST. {str(e)}"],
+            "error_type": "ast_decoder:decoder_failed",
+            "prompt": prompt_item,
+            "model_result_raw": model_result_content_raw,
+            "possible_answer": possible_answer_item,
+        }, False
+
+    decoder_output_valid = is_function_calling_format_output(model_result_content)
+    if not decoder_output_valid:
+        return i, {
+            "id": index,
+            "model_name": model_name,
+            "test_category": test_category,
+            "valid": False,
+            "error": [
+                "Did not output in the specified format. Note: the model_result is wrapped in a string to ensure json serializability."
+            ],
+            "error_type": "ast_decoder:decoder_wrong_output_format",
+            "prompt": prompt_item,
+            "model_result_raw": str(model_result_content_raw),
+            "model_result_decoded": str(model_result_content),
+            "possible_answer": possible_answer_item,
+        }, False
+
+    # Run both AST checker and LLM judge if judge_model is specified
+    if judge_model:
+        # Run AST checker first
+        ast_result = ast_checker(
+            prompt_item["function"],
+            model_result_content,
+            possible_answer_item,
+            language,
+            test_category,
+            model_name,
+        )
+        
+        # Run LLM judge
+        llm_result = llm_judge_checker(
+            model_result_content,
+            possible_answer_item,
+            judge_model,
+            available_functions=prompt_item["function"]
+        )
+        
+        # Compare results and create combined result
+        checker_result = {
+            "ast_valid": ast_result["valid"],
+            "llm_valid": llm_result["valid"],
+            "valid": llm_result["valid"],  # Use LLM judge as primary
+            "ast_reasoning": ast_result.get("reasoning", ast_result.get("error", [])),
+            "llm_reasoning": llm_result.get("reasoning", ""),
+            "error_type": llm_result.get("error_type", "unknown"),
+            "agreement": ast_result["valid"] == llm_result["valid"]
+        }
+        
+        # Add disagreement info if they don't agree
+        if not checker_result["agreement"]:
+            checker_result["disagreement_details"] = {
+                "ast_says": "VALID" if ast_result["valid"] else "INVALID",
+                "llm_says": "VALID" if llm_result["valid"] else "INVALID",
+                "ast_error_type": ast_result.get("error_type", "unknown"),
+                "llm_error_type": llm_result.get("error_type", "unknown")
+            }
+    else:
+        # Use only AST checker
+        checker_result = ast_checker(
+            prompt_item["function"],
+            model_result_content,
+            possible_answer_item,
+            language,
+            test_category,
+            model_name,
+        )
+
+    if checker_result["valid"]:
+        # For valid results, still track comparison data if using judge
+        if judge_model and not checker_result.get("agreement", True):
+            temp = {}
+            temp["id"] = index
+            temp["model_name"] = model_name
+            temp["test_category"] = test_category
+            temp["valid"] = checker_result["valid"]
+            temp["ast_valid"] = checker_result.get("ast_valid")
+            temp["llm_valid"] = checker_result.get("llm_valid")
+            temp["agreement"] = checker_result.get("agreement", True)
+            temp["disagreement_details"] = checker_result.get("disagreement_details", {})
+            temp["ast_reasoning"] = checker_result.get("ast_reasoning", "")
+            temp["llm_reasoning"] = checker_result.get("llm_reasoning", "")
+            temp["error_type"] = "comparison:disagreement_but_valid"
+            temp["prompt"] = prompt_item
+            temp["model_result_raw"] = model_result_content_raw
+            temp["model_result_decoded"] = model_result_content
+            temp["possible_answer"] = possible_answer_item
+            return i, temp, True
+        else:
+            return i, None, True
+    else:
+        temp = {}
+        temp["id"] = index
+        temp["model_name"] = model_name
+        temp["test_category"] = test_category
+        temp["valid"] = checker_result["valid"]
+        
+        # Add comparison data if using judge
+        if judge_model:
+            temp["ast_valid"] = checker_result.get("ast_valid")
+            temp["llm_valid"] = checker_result.get("llm_valid")
+            temp["agreement"] = checker_result.get("agreement", True)
+            temp["disagreement_details"] = checker_result.get("disagreement_details", {})
+            temp["ast_reasoning"] = checker_result.get("ast_reasoning", "")
+            temp["llm_reasoning"] = checker_result.get("llm_reasoning", "")
+        
+        temp["error"] = checker_result.get("reasoning", checker_result.get("error", []))
+        temp["error_type"] = checker_result.get("error_type", "unknown")
+        temp["prompt"] = prompt_item
+        temp["model_result_raw"] = model_result_content_raw
+        temp["model_result_decoded"] = model_result_content
+        temp["possible_answer"] = possible_answer_item
+        return i, temp, False
+
+
 def ast_file_runner(
     handler,
     model_result,
@@ -252,6 +494,7 @@ def ast_file_runner(
     test_category,
     model_name,
     score_dir,
+    judge_model=None,
 ):
     assert (
         len(model_result) == len(prompt) == len(possible_answer)
@@ -259,75 +502,175 @@ def ast_file_runner(
 
     result = []
     correct_count = 0
+    
+    # Tracking for comparison when using judge
+    ast_correct_count = 0
+    llm_correct_count = 0
+    agreement_count = 0
+    disagreements = []
+    
+    # Prepare arguments for parallel processing
+    args_list = []
     for i in range(len(model_result)):
-        index: str = model_result[i]["id"]
-        model_result_item = model_result[i]["result"]
-        prompt_item = prompt[i]["function"]
-        possible_answer_item = possible_answer[i]["ground_truth"]
-
-        try:
-            model_result_item_raw = model_result_item
-            model_result_item = handler.decode_ast(model_result_item, language)
-        except Exception as e:
-            result.append(
-                {
-                    "id": index,
-                    "model_name": model_name,
-                    "test_category": test_category,
-                    "valid": False,
-                    "error": [f"Invalid syntax. Failed to decode AST. {str(e)}"],
-                    "error_type": "ast_decoder:decoder_failed",
-                    "prompt": prompt[i],
-                    "model_result_raw": model_result_item_raw,
-                    "possible_answer": possible_answer_item,
-                }
-            )
-            continue
-
-        decoder_output_valid = is_function_calling_format_output(model_result_item)
-        if not decoder_output_valid:
-            result.append(
-                {
-                    "id": index,
-                    "model_name": model_name,
-                    "test_category": test_category,
-                    "valid": False,
-                    "error": [
-                        "Did not output in the specified format. Note: the model_result is wrapped in a string to ensure json serializability."
-                    ],
-                    "error_type": "ast_decoder:decoder_wrong_output_format",
-                    "prompt": prompt[i],
-                    "model_result_raw": str(model_result_item_raw),
-                    "model_result_decoded": str(model_result_item),
-                    "possible_answer": possible_answer_item,
-                }
-            )
-            continue
-
-        checker_result = ast_checker(
-            prompt_item,
-            model_result_item,
-            possible_answer_item,
+        args_list.append((
+            i,
+            handler,
+            model_result[i],
+            prompt[i],
+            possible_answer[i]["ground_truth"],
             language,
             test_category,
             model_name,
-        )
-
-        if checker_result["valid"]:
-            correct_count += 1
-        else:
-            temp = {}
-            temp["id"] = index
-            temp["model_name"] = model_name
-            temp["test_category"] = test_category
-            temp["valid"] = checker_result["valid"]
-            temp["error"] = checker_result["error"]
-            temp["error_type"] = checker_result["error_type"]
-            temp["prompt"] = prompt[i]
-            temp["model_result_raw"] = model_result_item_raw
-            temp["model_result_decoded"] = model_result_item
-            temp["possible_answer"] = possible_answer_item
-            result.append(temp)
+            judge_model
+        ))
+    
+    # Use parallel processing if using LLM judge, otherwise process sequentially
+    if judge_model:
+        print(f"🚀 Processing {len(args_list)} test cases in parallel with LLM judge...")
+        
+        # Use ThreadPoolExecutor for parallel API calls
+        max_workers = min(8, len(args_list))  # Limit concurrent API calls
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_index = {executor.submit(evaluate_single_test_case, args): args[0] for args in args_list}
+            
+            # Process results as they complete
+            for future in tqdm(concurrent.futures.as_completed(future_to_index), 
+                             total=len(future_to_index), 
+                             desc="Evaluating with LLM judge"):
+                try:
+                    i, result_dict, is_correct = future.result()
+                    if is_correct:
+                        correct_count += 1
+                    
+                    # Track comparison statistics for all cases when using judge
+                    if judge_model:
+                        if result_dict:
+                            ast_valid = result_dict.get("ast_valid")
+                            llm_valid = result_dict.get("llm_valid")
+                            agreement = result_dict.get("agreement", True)
+                            
+                            if ast_valid is not None:
+                                if ast_valid:
+                                    ast_correct_count += 1
+                            if llm_valid is not None:
+                                if llm_valid:
+                                    llm_correct_count += 1
+                            
+                            if agreement:
+                                agreement_count += 1
+                            else:
+                                disagreements.append(result_dict)
+                            
+                            # Save individual comparison file
+                            save_individual_comparison(result_dict, score_dir, model_name, test_category)
+                        else:
+                            # For cases with no result_dict, we need to infer from is_correct
+                            # This happens when both AST and LLM agree on valid result
+                            if is_correct:
+                                ast_correct_count += 1
+                                llm_correct_count += 1
+                                agreement_count += 1
+                                
+                                # Create a minimal comparison record for agreement cases
+                                test_case_id = model_result[future_to_index[future]]["id"]
+                                agreement_record = {
+                                    "id": test_case_id,
+                                    "model_name": model_name,
+                                    "test_category": test_category,
+                                    "valid": True,
+                                    "ast_valid": True,
+                                    "llm_valid": True,
+                                    "agreement": True,
+                                    "ast_reasoning": "Valid function call",
+                                    "llm_reasoning": "Valid function call",
+                                    "error_type": "none",
+                                    "comparison_type": "both_agree_valid"
+                                }
+                                save_individual_comparison(agreement_record, score_dir, model_name, test_category)
+                    
+                    if result_dict:
+                        result.append(result_dict)
+                        
+                except Exception as e:
+                    print(f"❌ Error processing test case: {str(e)}")
+                    # Add error result for failed test case
+                    original_index = future_to_index[future]
+                    result.append({
+                        "id": model_result[original_index]["id"],
+                        "model_name": model_name,
+                        "test_category": test_category,
+                        "valid": False,
+                        "error": [f"Parallel processing error: {str(e)}"],
+                        "error_type": "parallel_processing:error",
+                        "prompt": prompt[original_index],
+                        "model_result_raw": model_result[original_index]["result"],
+                        "possible_answer": possible_answer[original_index]["ground_truth"],
+                    })
+        
+        print(f"✅ Completed parallel evaluation: {correct_count}/{len(model_result)} correct")
+        
+        # Print comparison summary if using judge
+        if judge_model:
+            print(f"\n📊 COMPARISON SUMMARY:")
+            print(f"   AST Checker:  {ast_correct_count}/{len(model_result)} correct ({ast_correct_count/len(model_result)*100:.1f}%)")
+            print(f"   LLM Judge:    {llm_correct_count}/{len(model_result)} correct ({llm_correct_count/len(model_result)*100:.1f}%)")
+            print(f"   Agreement:    {agreement_count}/{len(model_result)} cases ({agreement_count/len(model_result)*100:.1f}%)")
+            print(f"   Disagreements: {len(disagreements)} cases")
+            
+            # Save comparison summary
+            save_comparison_summary(
+                score_dir, model_name, test_category,
+                ast_correct_count, llm_correct_count, agreement_count,
+                len(model_result), disagreements
+            )
+            
+            if disagreements:
+                print(f"\n🔍 DISAGREEMENT ANALYSIS:")
+                ast_valid_llm_invalid = 0
+                ast_invalid_llm_valid = 0
+                
+                for disagreement in disagreements[:10]:  # Show first 10 disagreements
+                    details = disagreement.get("disagreement_details", {})
+                    if details.get("ast_says") == "VALID" and details.get("llm_says") == "INVALID":
+                        ast_valid_llm_invalid += 1
+                    elif details.get("ast_says") == "INVALID" and details.get("llm_says") == "VALID":
+                        ast_invalid_llm_valid += 1
+                    
+                    print(f"   Case {disagreement['id']}: AST={details.get('ast_says', 'N/A')} vs LLM={details.get('llm_says', 'N/A')}")
+                    print(f"      AST: {disagreement.get('ast_reasoning', 'No reasoning')[:100]}...")
+                    print(f"      LLM: {disagreement.get('llm_reasoning', 'No reasoning')[:100]}...")
+                    print()
+                
+                if len(disagreements) > 10:
+                    print(f"   ... and {len(disagreements) - 10} more disagreements")
+                
+                print(f"   AST Valid → LLM Invalid: {ast_valid_llm_invalid}")
+                print(f"   AST Invalid → LLM Valid: {ast_invalid_llm_valid}")
+    else:
+        # Sequential processing for AST checker (faster, no API calls)
+        print(f"🔄 Processing {len(args_list)} test cases sequentially with AST checker...")
+        
+        for args in tqdm(args_list, desc="Evaluating with AST checker"):
+            try:
+                i, result_dict, is_correct = evaluate_single_test_case(args)
+                if is_correct:
+                    correct_count += 1
+                elif result_dict:
+                    result.append(result_dict)
+            except Exception as e:
+                print(f"❌ Error processing test case {args[0]}: {str(e)}")
+                result.append({
+                    "id": model_result[args[0]]["id"],
+                    "model_name": model_name,
+                    "test_category": test_category,
+                    "valid": False,
+                    "error": [f"Processing error: {str(e)}"],
+                    "error_type": "processing:error",
+                    "prompt": prompt[args[0]],
+                    "model_result_raw": model_result[args[0]]["result"],
+                    "possible_answer": possible_answer[args[0]]["ground_truth"],
+                })
 
     accuracy = correct_count / len(model_result)
     result.insert(
@@ -346,7 +689,7 @@ def ast_file_runner(
 
 
 #### Main runner function ####
-def runner(model_names, test_categories, result_dir, score_dir):
+def runner(model_names, test_categories, result_dir, score_dir, judge_model=None):
 
     # State udpated by each eval subtask.
     state = dict(
@@ -376,16 +719,21 @@ def runner(model_names, test_categories, result_dir, score_dir):
         # Find and process all JSON files in the subdirectory
         for model_result_json in subdir.glob("*.json"):
             test_category = extract_test_category(model_result_json)
+            print(f"📁 Found test file: {model_result_json.name} -> category: {test_category}")
+            
             if test_category not in test_categories:
+                print(f"⏭️  Skipping {test_category} (not in requested categories: {test_categories})")
                 continue
 
             handler = get_handler(model_name_escaped)
 
             # We don't evaluate the following categories in the current iteration of the benchmark
             if is_chatable(test_category) or is_sql(test_category) or is_executable(test_category):
+                print(f"⏭️  Skipping {test_category} (chatable/sql/executable)")
                 continue
 
             model_result = load_file(model_result_json, sort_by_id=True)
+            print(f"📊 Loaded {len(model_result)} test cases for {test_category}")
 
             state = evaluate_task(
                 test_category,
@@ -395,6 +743,7 @@ def runner(model_names, test_categories, result_dir, score_dir):
                 model_name,
                 handler,
                 state,
+                judge_model,
             )
 
     # This function reads all the score files from local folder and updates the
@@ -415,6 +764,7 @@ def evaluate_task(
     model_name,
     handler,
     state,
+    judge_model=None,
 ):
 
     language = "Python"
@@ -463,6 +813,7 @@ def evaluate_task(
                 test_category,
                 model_name,
                 score_dir,
+                judge_model,
             )
 
     record_result(state["leaderboard_table"], model_name, test_category, accuracy, total_count)
@@ -471,7 +822,7 @@ def evaluate_task(
     return state
 
 
-def main(model, test_categories, result_dir, score_dir):
+def main(model, test_categories, result_dir, score_dir, judge_model=None):
     if result_dir is None:
         result_dir = RESULT_PATH
     else:
@@ -499,7 +850,7 @@ def main(model, test_categories, result_dir, score_dir):
             model_names.append(model_name.replace("/", "_"))
 
     # Driver function to run the evaluation for all categories involved.
-    runner(model_names, all_test_categories, result_dir, score_dir)
+    runner(model_names, all_test_categories, result_dir, score_dir, judge_model)
 
     print(
         f"🏁 Evaluation completed. See {score_dir / 'data_overall.csv'} for overall evaluation results on BFCL V3."
@@ -535,6 +886,12 @@ if __name__ == "__main__":
         type=str,
         help="Path to the folder where the evaluation score files will be stored; relative to the `berkeley-function-call-leaderboard` root folder",
     )
+    parser.add_argument(
+        "--judge",
+        default=None,
+        type=str,
+        help="Judge model to use for LLM-based evaluation (e.g., gpt-4, o3-mini-2025-01-31)",
+    )
 
     args = parser.parse_args()
 
@@ -544,4 +901,5 @@ if __name__ == "__main__":
         args.test_category,
         args.result_dir,
         args.score_dir,
+        args.judge,
     )
