@@ -27,6 +27,99 @@ from bfcl_eval.constants.model_config import MODEL_CONFIG_MAPPING
 from bfcl_eval.utils import *
 from dotenv import load_dotenv
 from tqdm import tqdm
+import json
+import os
+
+
+def save_individual_comparison(comparison_data, score_dir, model_name, test_category):
+    """
+    Save individual comparison between AST and LLM judge to a separate file.
+    
+    Args:
+        comparison_data: Dictionary containing comparison results
+        score_dir: Base score directory path
+        model_name: Name of the model being evaluated
+        test_category: Test category name
+    """
+    # Create comparisons subdirectory
+    comparisons_dir = score_dir / model_name / "comparisons" / test_category
+    os.makedirs(comparisons_dir, exist_ok=True)
+    
+    # Generate filename based on test case ID
+    test_case_id = comparison_data.get("id", "unknown")
+    filename = f"{test_case_id}_comparison.json"
+    filepath = comparisons_dir / filename
+    
+    # Save the comparison data
+    with open(filepath, 'w') as f:
+        json.dump(comparison_data, f, indent=2, default=str)
+
+
+def save_comparison_summary(score_dir, model_name, test_category, ast_correct, llm_correct, 
+                          agreement_count, total_count, disagreements):
+    """
+    Save a summary of all comparisons for this test category.
+    
+    Args:
+        score_dir: Base score directory path
+        model_name: Name of the model being evaluated
+        test_category: Test category name
+        ast_correct: Number of cases AST checker marked as correct
+        llm_correct: Number of cases LLM judge marked as correct
+        agreement_count: Number of cases where AST and LLM agreed
+        total_count: Total number of test cases
+        disagreements: List of disagreement cases
+    """
+    # Create comparisons subdirectory
+    comparisons_dir = score_dir / model_name / "comparisons"
+    os.makedirs(comparisons_dir, exist_ok=True)
+    
+    # Create summary data
+    summary = {
+        "test_category": test_category,
+        "model_name": model_name,
+        "total_cases": total_count,
+        "ast_correct": ast_correct,
+        "llm_correct": llm_correct,
+        "agreement_count": agreement_count,
+        "disagreement_count": len(disagreements),
+        "ast_accuracy": ast_correct / total_count if total_count > 0 else 0,
+        "llm_accuracy": llm_correct / total_count if total_count > 0 else 0,
+        "agreement_rate": agreement_count / total_count if total_count > 0 else 0,
+        "disagreement_breakdown": {
+            "ast_valid_llm_invalid": 0,
+            "ast_invalid_llm_valid": 0
+        },
+        "disagreement_cases": []
+    }
+    
+    # Analyze disagreements
+    for disagreement in disagreements:
+        details = disagreement.get("disagreement_details", {})
+        case_summary = {
+            "id": disagreement.get("id"),
+            "ast_says": details.get("ast_says", "N/A"),
+            "llm_says": details.get("llm_says", "N/A"),
+            "ast_reasoning": disagreement.get("ast_reasoning", "")[:200] + "..." if len(disagreement.get("ast_reasoning", "")) > 200 else disagreement.get("ast_reasoning", ""),
+            "llm_reasoning": disagreement.get("llm_reasoning", "")[:200] + "..." if len(disagreement.get("llm_reasoning", "")) > 200 else disagreement.get("llm_reasoning", "")
+        }
+        summary["disagreement_cases"].append(case_summary)
+        
+        # Count disagreement types
+        if details.get("ast_says") == "VALID" and details.get("llm_says") == "INVALID":
+            summary["disagreement_breakdown"]["ast_valid_llm_invalid"] += 1
+        elif details.get("ast_says") == "INVALID" and details.get("llm_says") == "VALID":
+            summary["disagreement_breakdown"]["ast_invalid_llm_valid"] += 1
+    
+    # Save summary
+    summary_filename = f"{test_category}_comparison_summary.json"
+    summary_filepath = comparisons_dir / summary_filename
+    
+    with open(summary_filepath, 'w') as f:
+        json.dump(summary, f, indent=2, default=str)
+    
+    print(f"💾 Saved comparison summary to: {summary_filepath}")
+    print(f"💾 Individual comparisons saved to: {comparisons_dir / test_category}/")
 
 
 def get_handler(model_name):
@@ -468,6 +561,9 @@ def ast_file_runner(
                                 agreement_count += 1
                             else:
                                 disagreements.append(result_dict)
+                            
+                            # Save individual comparison file
+                            save_individual_comparison(result_dict, score_dir, model_name, test_category)
                         else:
                             # For cases with no result_dict, we need to infer from is_correct
                             # This happens when both AST and LLM agree on valid result
@@ -475,6 +571,23 @@ def ast_file_runner(
                                 ast_correct_count += 1
                                 llm_correct_count += 1
                                 agreement_count += 1
+                                
+                                # Create a minimal comparison record for agreement cases
+                                test_case_id = model_result[future_to_index[future]]["id"]
+                                agreement_record = {
+                                    "id": test_case_id,
+                                    "model_name": model_name,
+                                    "test_category": test_category,
+                                    "valid": True,
+                                    "ast_valid": True,
+                                    "llm_valid": True,
+                                    "agreement": True,
+                                    "ast_reasoning": "Valid function call",
+                                    "llm_reasoning": "Valid function call",
+                                    "error_type": "none",
+                                    "comparison_type": "both_agree_valid"
+                                }
+                                save_individual_comparison(agreement_record, score_dir, model_name, test_category)
                     
                     if result_dict:
                         result.append(result_dict)
@@ -504,6 +617,13 @@ def ast_file_runner(
             print(f"   LLM Judge:    {llm_correct_count}/{len(model_result)} correct ({llm_correct_count/len(model_result)*100:.1f}%)")
             print(f"   Agreement:    {agreement_count}/{len(model_result)} cases ({agreement_count/len(model_result)*100:.1f}%)")
             print(f"   Disagreements: {len(disagreements)} cases")
+            
+            # Save comparison summary
+            save_comparison_summary(
+                score_dir, model_name, test_category,
+                ast_correct_count, llm_correct_count, agreement_count,
+                len(model_result), disagreements
+            )
             
             if disagreements:
                 print(f"\n🔍 DISAGREEMENT ANALYSIS:")
