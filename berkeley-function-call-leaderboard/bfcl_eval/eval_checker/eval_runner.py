@@ -309,7 +309,6 @@ def ast_file_runner(
         # Use LLM judge if specified, otherwise use AST checker
         if judge_model:
             checker_result = llm_judge_checker(
-                prompt_item,
                 model_result_item,
                 possible_answer_item,
                 judge_model,
@@ -332,7 +331,7 @@ def ast_file_runner(
             temp["model_name"] = model_name
             temp["test_category"] = test_category
             temp["valid"] = checker_result["valid"]
-            temp["error"] = checker_result["error"]
+            temp["error"] = checker_result.get("reasoning", checker_result.get("error", []))
             temp["error_type"] = checker_result["error_type"]
             temp["prompt"] = prompt[i]
             temp["model_result_raw"] = model_result_item_raw

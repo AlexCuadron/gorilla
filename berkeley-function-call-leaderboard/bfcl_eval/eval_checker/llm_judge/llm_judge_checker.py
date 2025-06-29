@@ -37,11 +37,10 @@ class LLMJudgeChecker:
         else:
             raise ValueError(f"Judge model '{judge_model}' not found in MODEL_CONFIG_MAPPING")
     
-    def create_judge_prompt(self, ground_truth: Dict[str, Any], model_output: Any, 
-                          available_functions: List[Dict[str, Any]]) -> str:
+    def create_judge_prompt(self, ground_truth: Dict[str, Any], model_output: Any) -> str:
         """Create an extremely critical evaluation prompt for the LLM judge."""
-        
-        prompt = f"""You are an EXTREMELY CRITICAL function calling evaluator. Your job is to determine if a model's function call output EXACTLY matches the expected ground truth.
+
+        prompt = f"""You are an EXTREMELY CRITICAL function calling evaluator. Your job is to determine if a model's function call output matches the expected ground truth.
 
 You must be EXTREMELY STRICT about:
 1. **Function Name**: Must match EXACTLY (case-sensitive, no variations allowed)
@@ -51,23 +50,18 @@ You must be EXTREMELY STRICT about:
 
 **GROUND TRUTH (Expected Output):**
 ```json
-{json.dumps(ground_truth, indent=2)}
+{json.dumps(ground_truth)}
 ```
 
 **MODEL OUTPUT (Actual Output):**
 ```json
-{json.dumps(model_output, indent=2)}
-```
-
-**AVAILABLE FUNCTIONS:**
-```json
-{json.dumps(available_functions, indent=2)}
+{json.dumps(model_output)}
 ```
 
 **EVALUATION CRITERIA:**
 
 1. **Function Name Matching**: 
-   - The function name must be EXACTLY the same as in ground truth
+   - The function name must be semantically similar to the ground truth
    - No synonyms, abbreviations, or variations are acceptable
    - Case sensitivity matters
 
@@ -85,7 +79,6 @@ You must be EXTREMELY STRICT about:
 You must respond with ONLY a JSON object:
 {{
     "valid": true/false,
-    "errors": ["list of specific errors found"],
     "reasoning": "detailed explanation of your evaluation"
 }}
 
@@ -98,15 +91,14 @@ Be EXTREMELY CRITICAL. If there's ANY doubt, mark it as invalid.
         
         return prompt
     
-    def evaluate_function_call(self, ground_truth: Dict[str, Any], model_output: Any,
-                             available_functions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def evaluate_function_call(self, ground_truth: Dict[str, Any], model_output: Any) -> Dict[str, Any]:
         """Evaluate a single function call using the LLM judge."""
         
         try:
             print(f"🔍 Evaluating function call with judge model: {self.judge_model}")
             
             # Create the evaluation prompt
-            prompt = self.create_judge_prompt(ground_truth, model_output, available_functions)
+            prompt = self.create_judge_prompt(ground_truth, model_output)
             
             print(f"📝 Created evaluation prompt (length: {len(prompt)} chars)")
             
@@ -201,7 +193,7 @@ Be EXTREMELY CRITICAL. If there's ANY doubt, mark it as invalid.
             }
 
 
-def llm_judge_checker(func_description: List[Dict[str, Any]], model_output: List[Any], 
+def llm_judge_checker(model_output: List[Any], 
                      possible_answer: List[Dict[str, Any]], judge_model: str = "gpt-4") -> Dict[str, Any]:
     """
     Main function for LLM judge evaluation.
@@ -223,8 +215,7 @@ def llm_judge_checker(func_description: List[Dict[str, Any]], model_output: List
     if len(possible_answer) == 1 and len(model_output) == 1:
         return judge.evaluate_function_call(
             ground_truth=possible_answer[0],
-            model_output=model_output[0],
-            available_functions=func_description
+            model_output=model_output[0]
         )
     
     # Handle multiple function calls (parallel/multiple)
@@ -234,8 +225,7 @@ def llm_judge_checker(func_description: List[Dict[str, Any]], model_output: List
             gt, output = args
             return judge.evaluate_function_call(
                 ground_truth=gt,
-                model_output=output,
-                available_functions=func_description
+                model_output=output
             )
         
         # Process in parallel with ThreadPoolExecutor
