@@ -180,17 +180,34 @@ def convert_to_tool(functions, mapping, model_style):
 
 
 def convert_to_function_call(function_call_list):
+    # Handle case where input is not a list or dict (e.g., string response)
+    if isinstance(function_call_list, str):
+        return [function_call_list]  # Return as-is for error handling
+    
     if type(function_call_list) == dict:
         function_call_list = [function_call_list]
+    
+    # Handle case where input is not a list
+    if not isinstance(function_call_list, list):
+        return [str(function_call_list)]
+    
     # function_call_list is of type list[dict[str, str]] or list[dict[str, dict]]
     execution_list = []
     for function_call in function_call_list:
-        for key, value in function_call.items():
-            if type(value) == str:
-                value = json.loads(value)
-            execution_list.append(
-                f"{key}({','.join([f'{k}={repr(v)}' for k,v in value.items()])})"
-            )
+        # Skip non-dict items
+        if not isinstance(function_call, dict):
+            continue
+            
+        try:
+            for key, value in function_call.items():
+                if type(value) == str:
+                    value = json.loads(value)
+                execution_list.append(
+                    f"{key}({','.join([f'{k}={repr(v)}' for k,v in value.items()])})"
+                )
+        except (json.JSONDecodeError, AttributeError, TypeError) as e:
+            # Skip malformed function calls
+            continue
 
     return execution_list
 

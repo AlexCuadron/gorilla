@@ -27,10 +27,23 @@ class OpenAIHandler(BaseHandler):
     def decode_ast(self, result, language="Python"):
         if "FC" in self.model_name or self.is_fc_model:
             decoded_output = []
+            # Handle case where result is not a list (e.g., when model returns text instead of function calls)
+            if not isinstance(result, list):
+                # If result is a string (text response), return it as-is for error handling
+                return result
+            
             for invoked_function in result:
-                name = list(invoked_function.keys())[0]
-                params = json.loads(invoked_function[name])
-                decoded_output.append({name: params})
+                # Ensure invoked_function is a dictionary
+                if not isinstance(invoked_function, dict):
+                    continue
+                    
+                try:
+                    name = list(invoked_function.keys())[0]
+                    params = json.loads(invoked_function[name])
+                    decoded_output.append({name: params})
+                except (IndexError, KeyError, json.JSONDecodeError) as e:
+                    # Skip malformed function calls
+                    continue
             return decoded_output
         else:
             return default_decode_ast_prompting(result, language)
@@ -102,14 +115,26 @@ class OpenAIHandler(BaseHandler):
 
     def _parse_query_response_FC(self, api_response: any) -> dict:
         try:
-            model_responses = [
-                {func_call.function.name: func_call.function.arguments}
-                for func_call in api_response.choices[0].message.tool_calls
-            ]
-            tool_call_ids = [
-                func_call.id for func_call in api_response.choices[0].message.tool_calls
-            ]
-        except:
+            # Check if the response has tool calls
+            if (hasattr(api_response.choices[0].message, 'tool_calls') and 
+                api_response.choices[0].message.tool_calls is not None and 
+                len(api_response.choices[0].message.tool_calls) > 0):
+                
+                model_responses = [
+                    {func_call.function.name: func_call.function.arguments}
+                    for func_call in api_response.choices[0].message.tool_calls
+                ]
+                tool_call_ids = [
+                    func_call.id for func_call in api_response.choices[0].message.tool_calls
+                ]
+            else:
+                # No tool calls, use text content
+                model_responses = api_response.choices[0].message.content
+                tool_call_ids = []
+                
+        except Exception as e:
+            # Fallback to text content if parsing fails
+            print(f"Warning: Failed to parse tool calls, using text content. Error: {e}")
             model_responses = api_response.choices[0].message.content
             tool_call_ids = []
 
