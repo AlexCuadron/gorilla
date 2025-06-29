@@ -207,6 +207,129 @@ class ToolScalingBenchmarkEfficient:
         
         return " ".join(text_parts)
     
+    def _normalize_tool_to_bfcl_format(self, tool: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize a tool from any format to standard BFCL format."""
+        normalized_tool = {}
+        
+        # 1. BFCL format: {name, description, parameters} - already correct
+        if ('name' in tool and 'description' in tool and 
+            'parameters' in tool and isinstance(tool.get('parameters'), dict)):
+            return tool.copy()
+        
+        # 2. APIZoo/RapidAPI format: {api_name, description, parameters}
+        elif 'api_name' in tool or ('name' in tool and 'parameters' in tool and isinstance(tool.get('parameters'), list)):
+            normalized_tool['name'] = tool.get('api_name', tool.get('name', 'unknown_function'))
+            normalized_tool['description'] = tool.get('description', tool.get('functionality', ''))
+            
+            # Handle parameters - might be list or dict format
+            params = tool.get('parameters', [])
+            if isinstance(params, list):
+                # Convert list format to dict format
+                properties = {}
+                required = []
+                for param in params:
+                    if isinstance(param, dict) and 'name' in param:
+                        param_name = param['name']
+                        properties[param_name] = {
+                            'type': param.get('type', 'string').lower(),
+                            'description': param.get('description', '')
+                        }
+                        # Assume all parameters are required if not specified
+                        required.append(param_name)
+                
+                normalized_tool['parameters'] = {
+                    'type': 'object',
+                    'properties': properties,
+                    'required': required
+                }
+            else:
+                normalized_tool['parameters'] = params
+        
+        # 3. Hugging Face/API format: {api_call, provider, api_data}
+        elif 'api_call' in tool and 'api_data' in tool:
+            api_data = tool.get('api_data', {})
+            normalized_tool['name'] = api_data.get('api_name', tool.get('provider', 'unknown_function'))
+            normalized_tool['description'] = api_data.get('description', tool.get('code', ''))
+            
+            # Extract parameters from api_arguments if available
+            api_args = api_data.get('api_arguments', [])
+            if isinstance(api_args, list):
+                properties = {}
+                required = []
+                for arg in api_args:
+                    if isinstance(arg, str):
+                        properties[arg] = {
+                            'type': 'string',
+                            'description': f'Parameter for {arg}'
+                        }
+                        required.append(arg)
+                
+                normalized_tool['parameters'] = {
+                    'type': 'object',
+                    'properties': properties,
+                    'required': required
+                }
+            elif isinstance(api_args, dict):
+                # Convert dict format
+                properties = {}
+                required = []
+                for key, value in api_args.items():
+                    properties[key] = {
+                        'type': 'string' if not isinstance(value, bool) else 'boolean',
+                        'description': f'Parameter for {key}'
+                    }
+                    required.append(key)
+                
+                normalized_tool['parameters'] = {
+                    'type': 'object',
+                    'properties': properties,
+                    'required': required
+                }
+            else:
+                normalized_tool['parameters'] = {
+                    'type': 'object',
+                    'properties': {},
+                    'required': []
+                }
+        
+        # 4. Generic fallback
+        else:
+            # Try to extract name from various fields
+            name = None
+            for key in ['name', 'api_name', 'function_name', 'title']:
+                if key in tool and tool[key]:
+                    name = tool[key]
+                    break
+            
+            # Try to extract description from various fields
+            description = None
+            for key in ['description', 'summary', 'functionality', 'purpose']:
+                if key in tool and tool[key]:
+                    description = tool[key]
+                    break
+            
+            normalized_tool['name'] = name or 'unknown_function'
+            normalized_tool['description'] = description or str(tool)
+            normalized_tool['parameters'] = {
+                'type': 'object',
+                'properties': {},
+                'required': []
+            }
+        
+        # Ensure all required fields are present
+        if 'name' not in normalized_tool:
+            normalized_tool['name'] = 'unknown_function'
+        if 'description' not in normalized_tool:
+            normalized_tool['description'] = ''
+        if 'parameters' not in normalized_tool:
+            normalized_tool['parameters'] = {
+                'type': 'object',
+                'properties': {},
+                'required': []
+            }
+        
+        return normalized_tool
+    
     def aggregate_all_tools(self) -> List[Dict[str, Any]]:
         """Aggregate all tools from ALL Gorilla datasets."""
         import ast
@@ -624,11 +747,13 @@ class ToolScalingBenchmarkEfficient:
         # Sort by similarity (descending)
         sorted_indices = np.argsort(similarities)[::-1]
         
-        # Get top-k tools using pre-computed mapping
+        # Get top-k tools using pre-computed mapping and normalize them
         top_k_tools = []
         for i in sorted_indices[:k]:
             tool_hash = tool_hashes[i]
-            top_k_tools.append(hash_to_tool[tool_hash])
+            original_tool = hash_to_tool[tool_hash]
+            normalized_tool = self._normalize_tool_to_bfcl_format(original_tool)
+            top_k_tools.append(normalized_tool)
         
         return top_k_tools
     
@@ -645,11 +770,13 @@ class ToolScalingBenchmarkEfficient:
         # Sort by similarity (descending)
         sorted_indices = np.argsort(similarities)[::-1]
         
-        # Get top-k tools using pre-computed mapping
+        # Get top-k tools using pre-computed mapping and normalize them
         top_k_tools = []
         for i in sorted_indices[:k]:
             tool_hash = tool_hashes[i]
-            top_k_tools.append(hash_to_tool[tool_hash])
+            original_tool = hash_to_tool[tool_hash]
+            normalized_tool = self._normalize_tool_to_bfcl_format(original_tool)
+            top_k_tools.append(normalized_tool)
         
         return top_k_tools
     
