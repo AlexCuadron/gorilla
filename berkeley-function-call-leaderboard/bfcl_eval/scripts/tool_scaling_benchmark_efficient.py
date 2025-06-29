@@ -16,6 +16,7 @@ import json
 import os
 import pickle
 import hashlib
+import random
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 import numpy as np
@@ -213,8 +214,20 @@ class ToolScalingBenchmarkEfficient:
         
         # 1. BFCL format: {name, description, parameters} - already correct
         if ('name' in tool and 'description' in tool and 
-            'parameters' in tool and isinstance(tool.get('parameters'), dict)):
+            'parameters' in tool and isinstance(tool.get('parameters'), dict) and
+            'properties' in tool.get('parameters', {}) and 
+            tool.get('parameters', {}).get('type') == 'object'):
             return tool.copy()
+        
+        # 1.5. BFCL format with wrong type field (type: "dict" instead of "object")
+        elif ('name' in tool and 'description' in tool and 
+              'parameters' in tool and isinstance(tool.get('parameters'), dict) and
+              'properties' in tool.get('parameters', {})):
+            # Fix the type field
+            normalized_tool = tool.copy()
+            normalized_tool['parameters'] = tool['parameters'].copy()
+            normalized_tool['parameters']['type'] = 'object'
+            return normalized_tool
         
         # 2. APIZoo/RapidAPI format: {api_name, description, parameters} or required/optional format
         elif ('api_name' in tool or 
@@ -788,6 +801,10 @@ class ToolScalingBenchmarkEfficient:
             normalized_tool = self._normalize_tool_to_bfcl_format(original_tool)
             top_k_tools.append(normalized_tool)
         
+        # Randomize tool order with seed 42 for reproducibility
+        random.seed(42)
+        random.shuffle(top_k_tools)
+        
         return top_k_tools
     
     def _find_top_k_tools_optimized(self, query_embedding: np.ndarray, embeddings_matrix: np.ndarray,
@@ -810,6 +827,10 @@ class ToolScalingBenchmarkEfficient:
             original_tool = hash_to_tool[tool_hash]
             normalized_tool = self._normalize_tool_to_bfcl_format(original_tool)
             top_k_tools.append(normalized_tool)
+        
+        # Randomize tool order with seed 42 for reproducibility
+        random.seed(42)
+        random.shuffle(top_k_tools)
         
         return top_k_tools
     
