@@ -295,15 +295,47 @@ def evaluate_single_test_case(args):
             "possible_answer": possible_answer_item,
         }, False
 
-    # Use LLM judge if specified, otherwise use AST checker
+    # Run both AST checker and LLM judge if judge_model is specified
     if judge_model:
-        checker_result = llm_judge_checker(
+        # Run AST checker first
+        ast_result = ast_checker(
+            prompt_item["function"],
+            model_result_content,
+            possible_answer_item,
+            language,
+            test_category,
+            model_name,
+        )
+        
+        # Run LLM judge
+        llm_result = llm_judge_checker(
             model_result_content,
             possible_answer_item,
             judge_model,
             available_functions=prompt_item["function"]
         )
+        
+        # Compare results and create combined result
+        checker_result = {
+            "ast_valid": ast_result["valid"],
+            "llm_valid": llm_result["valid"],
+            "valid": llm_result["valid"],  # Use LLM judge as primary
+            "ast_reasoning": ast_result.get("reasoning", ast_result.get("error", [])),
+            "llm_reasoning": llm_result.get("reasoning", ""),
+            "error_type": llm_result.get("error_type", "unknown"),
+            "agreement": ast_result["valid"] == llm_result["valid"]
+        }
+        
+        # Add disagreement info if they don't agree
+        if not checker_result["agreement"]:
+            checker_result["disagreement_details"] = {
+                "ast_says": "VALID" if ast_result["valid"] else "INVALID",
+                "llm_says": "VALID" if llm_result["valid"] else "INVALID",
+                "ast_error_type": ast_result.get("error_type", "unknown"),
+                "llm_error_type": llm_result.get("error_type", "unknown")
+            }
     else:
+        # Use only AST checker
         checker_result = ast_checker(
             prompt_item["function"],
             model_result_content,
@@ -314,15 +346,45 @@ def evaluate_single_test_case(args):
         )
 
     if checker_result["valid"]:
-        return i, None, True
+        # For valid results, still track comparison data if using judge
+        if judge_model and not checker_result.get("agreement", True):
+            temp = {}
+            temp["id"] = index
+            temp["model_name"] = model_name
+            temp["test_category"] = test_category
+            temp["valid"] = checker_result["valid"]
+            temp["ast_valid"] = checker_result.get("ast_valid")
+            temp["llm_valid"] = checker_result.get("llm_valid")
+            temp["agreement"] = checker_result.get("agreement", True)
+            temp["disagreement_details"] = checker_result.get("disagreement_details", {})
+            temp["ast_reasoning"] = checker_result.get("ast_reasoning", "")
+            temp["llm_reasoning"] = checker_result.get("llm_reasoning", "")
+            temp["error_type"] = "comparison:disagreement_but_valid"
+            temp["prompt"] = prompt_item
+            temp["model_result_raw"] = model_result_content_raw
+            temp["model_result_decoded"] = model_result_content
+            temp["possible_answer"] = possible_answer_item
+            return i, temp, True
+        else:
+            return i, None, True
     else:
         temp = {}
         temp["id"] = index
         temp["model_name"] = model_name
         temp["test_category"] = test_category
         temp["valid"] = checker_result["valid"]
+        
+        # Add comparison data if using judge
+        if judge_model:
+            temp["ast_valid"] = checker_result.get("ast_valid")
+            temp["llm_valid"] = checker_result.get("llm_valid")
+            temp["agreement"] = checker_result.get("agreement", True)
+            temp["disagreement_details"] = checker_result.get("disagreement_details", {})
+            temp["ast_reasoning"] = checker_result.get("ast_reasoning", "")
+            temp["llm_reasoning"] = checker_result.get("llm_reasoning", "")
+        
         temp["error"] = checker_result.get("reasoning", checker_result.get("error", []))
-        temp["error_type"] = checker_result["error_type"]
+        temp["error_type"] = checker_result.get("error_type", "unknown")
         temp["prompt"] = prompt_item
         temp["model_result_raw"] = model_result_content_raw
         temp["model_result_decoded"] = model_result_content
@@ -347,6 +409,12 @@ def ast_file_runner(
 
     result = []
     correct_count = 0
+    
+    # Tracking for comparison when using judge
+    ast_correct_count = 0
+    llm_correct_count = 0
+    agreement_count = 0
+    disagreements = []
     
     # Prepare arguments for parallel processing
     args_list = []
@@ -381,8 +449,36 @@ def ast_file_runner(
                     i, result_dict, is_correct = future.result()
                     if is_correct:
                         correct_count += 1
-                    elif result_dict:
+                    
+                    # Track comparison statistics for all cases when using judge
+                    if judge_model:
+                        if result_dict:
+                            ast_valid = result_dict.get("ast_valid")
+                            llm_valid = result_dict.get("llm_valid")
+                            agreement = result_dict.get("agreement", True)
+                            
+                            if ast_valid is not None:
+                                if ast_valid:
+                                    ast_correct_count += 1
+                            if llm_valid is not None:
+                                if llm_valid:
+                                    llm_correct_count += 1
+                            
+                            if agreement:
+                                agreement_count += 1
+                            else:
+                                disagreements.append(result_dict)
+                        else:
+                            # For cases with no result_dict, we need to infer from is_correct
+                            # This happens when both AST and LLM agree on valid result
+                            if is_correct:
+                                ast_correct_count += 1
+                                llm_correct_count += 1
+                                agreement_count += 1
+                    
+                    if result_dict:
                         result.append(result_dict)
+                        
                 except Exception as e:
                     print(f"❌ Error processing test case: {str(e)}")
                     # Add error result for failed test case
@@ -400,6 +496,37 @@ def ast_file_runner(
                     })
         
         print(f"✅ Completed parallel evaluation: {correct_count}/{len(model_result)} correct")
+        
+        # Print comparison summary if using judge
+        if judge_model:
+            print(f"\n📊 COMPARISON SUMMARY:")
+            print(f"   AST Checker:  {ast_correct_count}/{len(model_result)} correct ({ast_correct_count/len(model_result)*100:.1f}%)")
+            print(f"   LLM Judge:    {llm_correct_count}/{len(model_result)} correct ({llm_correct_count/len(model_result)*100:.1f}%)")
+            print(f"   Agreement:    {agreement_count}/{len(model_result)} cases ({agreement_count/len(model_result)*100:.1f}%)")
+            print(f"   Disagreements: {len(disagreements)} cases")
+            
+            if disagreements:
+                print(f"\n🔍 DISAGREEMENT ANALYSIS:")
+                ast_valid_llm_invalid = 0
+                ast_invalid_llm_valid = 0
+                
+                for disagreement in disagreements[:10]:  # Show first 10 disagreements
+                    details = disagreement.get("disagreement_details", {})
+                    if details.get("ast_says") == "VALID" and details.get("llm_says") == "INVALID":
+                        ast_valid_llm_invalid += 1
+                    elif details.get("ast_says") == "INVALID" and details.get("llm_says") == "VALID":
+                        ast_invalid_llm_valid += 1
+                    
+                    print(f"   Case {disagreement['id']}: AST={details.get('ast_says', 'N/A')} vs LLM={details.get('llm_says', 'N/A')}")
+                    print(f"      AST: {disagreement.get('ast_reasoning', 'No reasoning')[:100]}...")
+                    print(f"      LLM: {disagreement.get('llm_reasoning', 'No reasoning')[:100]}...")
+                    print()
+                
+                if len(disagreements) > 10:
+                    print(f"   ... and {len(disagreements) - 10} more disagreements")
+                
+                print(f"   AST Valid → LLM Invalid: {ast_valid_llm_invalid}")
+                print(f"   AST Invalid → LLM Valid: {ast_invalid_llm_valid}")
     else:
         # Sequential processing for AST checker (faster, no API calls)
         print(f"🔄 Processing {len(args_list)} test cases sequentially with AST checker...")
